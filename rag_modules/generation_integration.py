@@ -4,6 +4,7 @@
 
 import logging
 import os
+import re
 from typing import List, Optional
 
 from openai import OpenAI
@@ -15,7 +16,40 @@ logger = logging.getLogger(__name__)
 class GenerationIntegrationModule:
     """生成集成模块 - 负责法律场景答案生成"""
 
-    DISCLAIMER_TEXT = "免责声明：本回答仅供参考，不构成法律意见，需由专业法律人士复核。"
+    HUMANIZED_OPENERS = {
+        "strong": [
+            "你这个问题很关键，我先给你可直接使用的结论。",
+            "先说核心结论，再给你对应的依据和操作建议。",
+            "我按结论、依据和建议三个层次给你说明，方便你直接落地。",
+        ],
+        "weak": [
+            "这个问题我先给你保守判断，再把不确定点说清楚。",
+            "先给你一个可参考的方向，同时把证据不足的地方标出来。",
+            "我先告诉你当前可得结论，再说明哪些点还需要核实。",
+        ],
+        "insufficient": [
+            "你这个问题很典型，但目前证据还不够，我先告诉你关键缺口。",
+            "先说明当前为什么不能下确定结论，再给你下一步补充方向。",
+            "我先把现有信息能支持到哪里讲清楚，再告诉你怎么补齐证据。",
+        ],
+    }
+    PARAGRAPH_HINTS = (
+        "先说",
+        "结论",
+        "依据",
+        "另外",
+        "同时",
+        "不过",
+        "但是",
+        "因此",
+        "所以",
+        "建议",
+        "如果",
+        "需要注意",
+        "最后",
+        "总之",
+        "当前",
+    )
 
     def __init__(
         self,
@@ -32,6 +66,7 @@ class GenerationIntegrationModule:
         self.enable_legal_disclaimer = enable_legal_disclaimer
         self.risk_notice_level = risk_notice_level
         self.llm_dispatcher = llm_dispatcher
+        self._opener_cursor = {key: 0 for key in self.HUMANIZED_OPENERS}
 
         # 向后兼容：保留直接Kimi客户端能力，供未接入调度层的调用路径使用。
         self.client = None
@@ -123,9 +158,10 @@ class GenerationIntegrationModule:
 
 输出要求（用户导向）：
 - 先用 1 段自然语言直接回答用户问题。
-- 全文尽量使用 2-4 段连续表达，必要时可加少量小标题，但不要强制编号，不要机械分点。
+- 根据语义适度分段，避免整段挤在一起；通常每段 2-4 句即可。
 - 依据说明要自然融入正文，优先引用“法规名+条号”；条号不确定时不进行引用“法规名+条号”。
 - 避免“命中率、召回、rerank、候选集”等技术术语，改为用户能理解的表达。
+- 可适度使用承接类人性化表达，但不要过度口语化，不要影响专业性。
 - 若证据不足，必须明确写“当前检索证据不足以作出确定判断”，并说明还需要补充什么信息。
 - {risk_instruction}
 - {mode_instruction}
@@ -142,12 +178,74 @@ class GenerationIntegrationModule:
         )
 
     def _ensure_disclaimer(self, text: str) -> str:
-        if not self.enable_legal_disclaimer:
-            return text
-        if self._has_disclaimer(text):
-            return text
-        logger.warning("模型输出未命中免责声明，已自动追加 disclaimer_appended=true")
-        return f"{text.rstrip()}\n\n{self.DISCLAIMER_TEXT}"
+        return text
+
+    def _pick_humanized_opener(self, answer_mode: str) -> str:
+        mode = (answer_mode or "strong").lower()
+        pool = self.HUMANIZED_OPENERS.get(mode) or self.HUMANIZED_OPENERS["strong"]
+        if not pool:
+            return ""
+        idx = self._opener_cursor.get(mode, 0) % len(pool)
+        self._opener_cursor[mode] = idx + 1
+        return pool[idx]
+
+    def _inject_humanized_opener(self, text: str, answer_mode: str) -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return raw
+        opener = self._pick_humanized_opener(answer_mode)
+        if not opener:
+            return raw
+        # 若模型已自然开场，避免重复注入。
+        if raw.startswith(("你这个问题", "先说", "我先", "这个问题")):
+            return raw
+        if opener[:8] in raw[:40]:
+            return raw
+        return f"{opener}\n\n{raw}"
+
+    def _semantic_paragraph_format(self, text: str) -> str:
+        raw = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not raw:
+            return raw
+
+        lines = [line.strip() for line in raw.split("\n") if line.strip()]
+        if not lines:
+            return ""
+
+        # 若已存在结构化列表/标题，尽量不破坏原结构，只做空行清理。
+        if any(line.startswith(("- ", "* ", "1.", "2.", "3.", "#")) for line in lines):
+            return "\n".join(lines)
+
+        compact = re.sub(r"\s+", " ", " ".join(lines)).strip()
+        sentences = [s.strip() for s in re.split(r"(?<=[。！？；!?;])\s*", compact) if s.strip()]
+        if len(sentences) <= 2:
+            return compact
+
+        paragraphs: List[str] = []
+        current: List[str] = []
+        for sentence in sentences:
+            if not current:
+                current.append(sentence)
+                continue
+
+            current_text = "".join(current)
+            should_break = (
+                (len(current_text) >= 100 and len(current) >= 2)
+                or any(sentence.startswith(hint) for hint in self.PARAGRAPH_HINTS)
+            )
+            if should_break:
+                paragraphs.append("".join(current).strip())
+                current = [sentence]
+            else:
+                current.append(sentence)
+
+        if current:
+            paragraphs.append("".join(current).strip())
+        return "\n\n".join(p for p in paragraphs if p)
+
+    def _post_process_answer(self, text: str, answer_mode: str) -> str:
+        with_opener = self._inject_humanized_opener(text, answer_mode=answer_mode)
+        return self._semantic_paragraph_format(with_opener)
 
     def _build_evidence_summary(self, documents: List[Document], limit: int = 3) -> str:
         if not documents:
@@ -169,7 +267,7 @@ class GenerationIntegrationModule:
             "建议你稍后重试一次；如果问题紧急，优先让专业法律人士结合法规原文做最终判断。"
         )
         logger.error("触发生成降级输出: %s", error)
-        return self._ensure_disclaimer(answer)
+        return self._post_process_answer(self._ensure_disclaimer(answer), answer_mode="weak")
 
     def _build_insufficient_answer(self, question: str, documents: List[Document]) -> str:
         answer = (
@@ -179,7 +277,7 @@ class GenerationIntegrationModule:
             "或直接给出你关心的法规名/条号，我可以据此继续精确检索并给出更稳妥的分析。\n\n"
             "在证据不充分时直接依据当前结果决策，可能导致判断偏差，建议让专业法律人士复核。"
         )
-        return self._ensure_disclaimer(answer)
+        return self._post_process_answer(self._ensure_disclaimer(answer), answer_mode="insufficient")
 
     def generate_adaptive_answer(
         self,
@@ -198,7 +296,10 @@ class GenerationIntegrationModule:
                 timeout=60,
             )
             raw_answer = response.choices[0].message.content.strip()
-            return self._ensure_disclaimer(raw_answer)
+            return self._post_process_answer(
+                self._ensure_disclaimer(raw_answer),
+                answer_mode=(answer_mode or "strong").lower(),
+            )
         except Exception as e:
             return self._build_degraded_answer(documents, e)
 
@@ -231,9 +332,9 @@ class GenerationIntegrationModule:
                     yield delta
 
             # 流式收敛后做免责声明后校验，若缺失自动补全
-            if self.enable_legal_disclaimer and not self._has_disclaimer(full_response):
-                logger.warning("流式输出未命中免责声明，已自动追加 disclaimer_appended=true")
-                yield f"\n\n{self.DISCLAIMER_TEXT}"
+            # if self.enable_legal_disclaimer and not self._has_disclaimer(full_response):
+            #     logger.warning("流式输出未命中免责声明，已自动追加 disclaimer_appended=true")
+            #     yield f"\n\n{self.DISCLAIMER_TEXT}"
             return
         except Exception as e:
             yield self._build_degraded_answer(documents, e)
