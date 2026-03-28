@@ -17,6 +17,7 @@ from langchain_community.retrievers import BM25Retriever
 from neo4j import GraphDatabase
 
 from .graph_indexing import GraphIndexingModule
+from .query_intent_template import QueryIntent, intent_to_keywords, parse_query_intent
 from .text_safety import sanitize_query_text
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,9 @@ class HybridRetrievalModule:
         self.topic_weight = 0.2
         self.vector_weight = 0.4
         self.min_final_score = 0.2
+        self.intent_enabled = bool(getattr(self.config, "intent_enabled", True))
+        self.rerank_enabled = bool(getattr(self.config, "rerank_enabled", True))
+        self.last_query_intent: Optional[QueryIntent] = None
 
     @staticmethod
     def _clamp_01(value: Any) -> float:
@@ -167,6 +171,38 @@ class HybridRetrievalModule:
         doc.metadata = md
         return doc
 
+    def _apply_intent_metadata(self, doc: Document, intent: Optional[QueryIntent]) -> Document:
+        doc = self._apply_result_contract(doc)
+        if intent is None:
+            return doc
+        md = doc.metadata or {}
+        md.update(
+            {
+                "intent_question_type": intent.question_type,
+                "intent_legal_domain": intent.legal_domain,
+                "intent_subject": intent.subject,
+                "intent_action": intent.action,
+                "law_candidates": list(intent.law_candidates),
+                "article_candidates": list(intent.article_candidates),
+                "must_terms": list(intent.must_terms),
+                "exclude_terms": list(intent.exclude_terms),
+            }
+        )
+        doc.metadata = md
+        return doc
+
+    def _parse_query_intent(self, query: str) -> QueryIntent:
+        query = sanitize_query_text(query)
+        intent = parse_query_intent(
+            query=query,
+            llm_dispatcher=self.llm_dispatcher if self.intent_enabled else None,
+            llm_client=self.llm_client if self.intent_enabled else None,
+            model_name=getattr(self.config, "llm_model", ""),
+            max_tokens=500,
+        )
+        self.last_query_intent = intent
+        return intent
+
     def _assist_chat_completion(self, messages: List[Dict[str, str]], max_tokens: int = 500):
         if self.llm_dispatcher is not None:
             response, provider, model = self.llm_dispatcher.create_chat_completion(
@@ -247,11 +283,23 @@ class HybridRetrievalModule:
             logger.error("提取法律图关系失败: %s", e)
         return relationships
 
-    def extract_query_keywords(self, query: str) -> Tuple[List[str], List[str]]:
+    def extract_query_keywords(
+        self,
+        query: str,
+        intent: Optional[QueryIntent] = None,
+    ) -> Tuple[List[str], List[str]]:
         """提取法律查询关键词（实体级 + 主题级）。"""
         query = sanitize_query_text(query)
         if not query:
             return [], []
+
+        if self.intent_enabled:
+            resolved_intent = intent or self._parse_query_intent(query)
+            intent_keywords = intent_to_keywords(resolved_intent, query)
+            entity_keywords = intent_keywords.get("entity_keywords", [])
+            topic_keywords = intent_keywords.get("topic_keywords", [])
+            if entity_keywords or topic_keywords:
+                return entity_keywords, topic_keywords
 
         prompt = f"""
         你是法律检索助手。请从下述问题提取两类关键词，并返回 JSON。
@@ -305,6 +353,87 @@ class HybridRetrievalModule:
         if not topic_keywords:
             topic_keywords = [query[:12]]
         return entity_keywords[:5], topic_keywords[:5]
+
+    def _document_match_text(self, doc: Document) -> str:
+        md = doc.metadata or {}
+        fields = [
+            doc.page_content or "",
+            str(md.get("display_title", "") or ""),
+            str(md.get("law_name", "") or ""),
+            str(md.get("article_title", "") or ""),
+            str(md.get("article_id", "") or ""),
+        ]
+        return " ".join(fields).lower()
+
+    def _calc_must_term_coverage(self, text: str, must_terms: List[str]) -> Tuple[int, float]:
+        terms = [sanitize_query_text(x).strip().lower() for x in (must_terms or []) if x and str(x).strip()]
+        if not terms:
+            return 0, 0.0
+        hit_count = sum(1 for term in terms if term and term in text)
+        return hit_count, self._clamp_01(hit_count / float(len(terms)))
+
+    def _calc_exclude_term_hits(self, text: str, exclude_terms: List[str]) -> int:
+        terms = [sanitize_query_text(x).strip().lower() for x in (exclude_terms or []) if x and str(x).strip()]
+        return sum(1 for term in terms if term and term in text)
+
+    def _calc_exact_title_or_article_hit(self, doc: Document, intent: QueryIntent) -> float:
+        if intent is None:
+            return 0.0
+        text = self._document_match_text(doc)
+        law_hits = any(term.lower() in text for term in intent.law_candidates)
+        article_hits = any(term.lower() in text for term in intent.article_candidates)
+        return 1.0 if law_hits or article_hits else 0.0
+
+    def _lightweight_rerank(
+        self,
+        docs: List[Document],
+        intent: Optional[QueryIntent],
+        top_k: int,
+    ) -> List[Document]:
+        if not docs:
+            return []
+
+        if intent is None:
+            for doc in docs:
+                md = doc.metadata or {}
+                md["rerank_score"] = round(
+                    self._clamp_01(md.get("final_score", md.get("relevance_score", 0.0))),
+                    4,
+                )
+                md["must_terms_hit_count"] = int(md.get("must_terms_hit_count", 0))
+                md["must_terms_hit_ratio"] = float(md.get("must_terms_hit_ratio", 0.0))
+                md["rerank_contract"] = "no_intent_fallback_to_final_score"
+                doc.metadata = md
+            return docs[:top_k]
+
+        reranked: List[Document] = []
+        for doc in docs:
+            doc = self._apply_intent_metadata(doc, intent)
+            md = doc.metadata or {}
+            base_score = self._clamp_01(md.get("final_score", md.get("relevance_score", 0.0)))
+            text = self._document_match_text(doc)
+            must_hit_count, must_hit_ratio = self._calc_must_term_coverage(text, intent.must_terms)
+            exact_hit = self._calc_exact_title_or_article_hit(doc, intent)
+            exclude_hits = self._calc_exclude_term_hits(text, intent.exclude_terms)
+
+            penalty = 0.1 if exclude_hits > 0 else 0.0
+            rerank_score = self._clamp_01(0.60 * base_score + 0.25 * must_hit_ratio + 0.15 * exact_hit - penalty)
+
+            md.update(
+                {
+                    "rerank_score": round(rerank_score, 4),
+                    "must_terms_hit_count": int(must_hit_count),
+                    "must_terms_hit_ratio": round(must_hit_ratio, 4),
+                    "exact_title_or_article_hit": round(exact_hit, 4),
+                    "exclude_terms_hit_count": int(exclude_hits),
+                    "rerank_contract": "rerank=0.60*final+0.25*must+0.15*exact-penalty",
+                }
+            )
+            doc.metadata = md
+            reranked.append(doc)
+
+        reranked.sort(key=lambda x: x.metadata.get("rerank_score", 0.0), reverse=True)
+        return reranked[:top_k]
 
     def _safe_json_loads(self, text: str) -> Dict[str, Any]:
         try:
@@ -509,12 +638,17 @@ class HybridRetrievalModule:
             logger.error("Neo4j主题检索失败: %s", e)
         return results
 
-    def dual_level_retrieval(self, query: str, top_k: int = 5) -> List[Document]:
+    def dual_level_retrieval(
+        self,
+        query: str,
+        top_k: int = 5,
+        intent: Optional[QueryIntent] = None,
+    ) -> List[Document]:
         query = sanitize_query_text(query)
         if not query:
             return []
 
-        entity_keywords, topic_keywords = self.extract_query_keywords(query)
+        entity_keywords, topic_keywords = self.extract_query_keywords(query, intent=intent)
         entity_results = self.entity_level_retrieval(entity_keywords, top_k)
         topic_results = self.topic_level_retrieval(topic_keywords, top_k)
 
@@ -524,22 +658,26 @@ class HybridRetrievalModule:
 
         documents: List[Document] = []
         for result in all_results[: top_k * 2]:
-            documents.append(
-                Document(
-                    page_content=result.content,
-                    metadata={
-                        "node_id": result.node_id,
-                        "node_type": result.node_type,
-                        "retrieval_level": result.retrieval_level,
-                        "relevance_score": result.relevance_score,
-                        "search_type": "dual_level",
-                        **result.metadata,
-                    },
-                )
+            doc = Document(
+                page_content=result.content,
+                metadata={
+                    "node_id": result.node_id,
+                    "node_type": result.node_type,
+                    "retrieval_level": result.retrieval_level,
+                    "relevance_score": result.relevance_score,
+                    "search_type": "dual_level",
+                    **result.metadata,
+                },
             )
+            documents.append(self._apply_intent_metadata(doc, intent))
         return documents
 
-    def vector_search_enhanced(self, query: str, top_k: int = 5) -> List[Document]:
+    def vector_search_enhanced(
+        self,
+        query: str,
+        top_k: int = 5,
+        intent: Optional[QueryIntent] = None,
+    ) -> List[Document]:
         query = sanitize_query_text(query)
         if not query:
             return []
@@ -568,7 +706,7 @@ class HybridRetrievalModule:
                         "score": result.get("score", 0.0),
                     },
                 )
-                enhanced_docs.append(self._apply_result_contract(doc))
+                enhanced_docs.append(self._apply_intent_metadata(doc, intent))
             return enhanced_docs[: top_k * 2]
         except Exception as e:
             logger.error("向量增强检索失败: %s", e)
@@ -602,8 +740,9 @@ class HybridRetrievalModule:
         if not query:
             return []
 
-        dual_docs = self.dual_level_retrieval(query, top_k)
-        vector_docs = self.vector_search_enhanced(query, top_k)
+        intent = self._parse_query_intent(query) if self.intent_enabled else None
+        dual_docs = self.dual_level_retrieval(query, top_k, intent=intent)
+        vector_docs = self.vector_search_enhanced(query, top_k, intent=intent)
         candidates: Dict[str, Dict[str, Any]] = {}
 
         def doc_key(doc: Document) -> str:
@@ -615,7 +754,7 @@ class HybridRetrievalModule:
         def ensure_candidate(key: str, doc: Document) -> Dict[str, Any]:
             if key not in candidates:
                 candidates[key] = {
-                    "doc": self._apply_result_contract(doc),
+                    "doc": self._apply_intent_metadata(doc, intent),
                     "entity_score": 0.0,
                     "topic_score": 0.0,
                     "vector_score": 0.0,
@@ -623,7 +762,7 @@ class HybridRetrievalModule:
             return candidates[key]
 
         for doc in dual_docs:
-            doc = self._apply_result_contract(doc)
+            doc = self._apply_intent_metadata(doc, intent)
             key = doc_key(doc)
             candidate = ensure_candidate(key, doc)
             raw_score = self._clamp_01(doc.metadata.get("relevance_score", 0.0))
@@ -634,17 +773,17 @@ class HybridRetrievalModule:
                 candidate["topic_score"] = max(candidate["topic_score"], raw_score)
             else:
                 candidate["topic_score"] = max(candidate["topic_score"], raw_score)
-            candidate["doc"] = self._apply_result_contract(candidate["doc"])
+            candidate["doc"] = self._apply_intent_metadata(candidate["doc"], intent)
 
         for doc in vector_docs:
-            doc = self._apply_result_contract(doc)
+            doc = self._apply_intent_metadata(doc, intent)
             key = doc_key(doc)
             candidate = ensure_candidate(key, doc)
             vector_score = self._normalize_vector_score(doc.metadata.get("score", 0.0))
             candidate["vector_score"] = max(candidate["vector_score"], vector_score)
             if not candidate["doc"].metadata.get("law_name") and doc.metadata.get("law_name"):
                 candidate["doc"] = doc
-            candidate["doc"] = self._apply_result_contract(candidate["doc"])
+            candidate["doc"] = self._apply_intent_metadata(candidate["doc"], intent)
 
         ranked_docs: List[Document] = []
         for candidate in candidates.values():
@@ -665,15 +804,23 @@ class HybridRetrievalModule:
                     "score_vector": round(vector_score, 4),
                     "final_score": round(self._clamp_01(final_score), 4),
                     "score_contract": "final=0.4*entity+0.2*topic+0.4*vector",
+                    "rerank_enabled": bool(self.rerank_enabled),
                 }
             )
             ranked_docs.append(doc)
 
         ranked_docs.sort(key=lambda x: x.metadata.get("final_score", 0.0), reverse=True)
         filtered_docs = [d for d in ranked_docs if d.metadata.get("final_score", 0.0) >= self.min_final_score]
-        if filtered_docs:
-            return filtered_docs[:top_k]
-        return ranked_docs[:top_k]
+        selected_docs = filtered_docs if filtered_docs else ranked_docs
+
+        if self.rerank_enabled:
+            return self._lightweight_rerank(selected_docs, intent=intent, top_k=top_k)
+
+        baseline_docs = self._lightweight_rerank(selected_docs, intent=intent, top_k=top_k)
+        for doc in baseline_docs:
+            doc.metadata["rerank_score"] = round(self._clamp_01(doc.metadata.get("final_score", 0.0)), 4)
+            doc.metadata["rerank_contract"] = "disabled_fallback_to_final_score"
+        return baseline_docs[:top_k]
 
     def _dedup_results(self, results: List[RetrievalResult]) -> List[RetrievalResult]:
         deduped: List[RetrievalResult] = []

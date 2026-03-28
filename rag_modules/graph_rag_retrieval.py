@@ -92,6 +92,40 @@ class GraphRAGRetrieval:
         "恶意伤人": "故意伤害",
     }
 
+    LEGAL_NAME_SUFFIXES = ("法", "法典", "条例", "规定", "办法", "解释", "罪")
+    ENTITY_BEHAVIOR_TERMS = {
+        "正当防卫",
+        "紧急避险",
+        "故意伤害",
+        "未成年人",
+        "诈骗",
+        "诈骗罪",
+        "盗窃",
+        "盗窃罪",
+        "非法经营罪",
+        "帮助信息网络犯罪活动罪",
+        "侵权",
+        "拖欠工资",
+        "辞退",
+        "工伤",
+        "违约",
+        "取保候审",
+        "劳动争议",
+        "劳动仲裁",
+    }
+    LAW_CORE_TERMS = {
+        "刑法",
+        "民法典",
+        "劳动法",
+        "劳动合同法",
+        "个人信息保护法",
+        "数据安全法",
+        "网络安全法",
+        "行政处罚法",
+        "刑事诉讼法",
+        "民事诉讼法",
+    }
+
     def __init__(self, config, llm_client, llm_dispatcher: Optional[object] = None):
         self.config = config
         self.llm_client = llm_client
@@ -252,6 +286,49 @@ class GraphRAGRetrieval:
             term = term[1:-1].strip()
         return term
 
+    def _get_graph_entity_max_len(self) -> int:
+        try:
+            return max(8, int(getattr(self.config, "graph_entity_max_len", 20)))
+        except Exception:
+            return 20
+
+    def _is_article_ref(self, term: str) -> bool:
+        return bool(re.fullmatch(r"第[0-9一二三四五六七八九十百千万〇零两]+条", term))
+
+    def _is_law_like_term(self, term: str) -> bool:
+        if any(term.endswith(suffix) for suffix in self.LEGAL_NAME_SUFFIXES):
+            return True
+        if term in self.LAW_CORE_TERMS:
+            return True
+        return False
+
+    def _is_whitelisted_entity_term(self, term: str) -> bool:
+        if self._is_article_ref(term):
+            return True
+        if self._is_law_like_term(term):
+            return True
+        if re.fullmatch(r"[一-龥]{2,30}罪", term):
+            return True
+        if term in self.LAW_CORE_TERMS:
+            return True
+        if term in self.ENTITY_BEHAVIOR_TERMS:
+            return True
+        if term in self.ENTITY_ALIAS_MAP or term in self.ENTITY_ALIAS_MAP.values():
+            return True
+        return False
+
+    def _is_valid_entity_term(self, term: str) -> bool:
+        normalized = self._normalize_entity_term(term)
+        if not normalized:
+            return False
+        if self._is_generic_label_token(normalized):
+            return False
+        if len(normalized) > self._get_graph_entity_max_len():
+            return False
+        if not self._is_whitelisted_entity_term(normalized):
+            return False
+        return True
+
     def _is_generic_label_token(self, token: str) -> bool:
         normalized = self._normalize_entity_term(token)
         if not normalized:
@@ -269,16 +346,70 @@ class GraphRAGRetrieval:
         for law in law_refs:
             terms.append(law.strip())
 
+        for law in self.LAW_CORE_TERMS:
+            if law in query:
+                terms.append(law)
+
         article_refs = re.findall(r"第[0-9一二三四五六七八九十百千万〇零两]+条", query)
         terms.extend(article_refs)
+        terms.extend(re.findall(r"[一-龥]{2,30}罪", query))
+
+        for behavior in self.ENTITY_BEHAVIOR_TERMS:
+            if behavior in query:
+                terms.append(behavior)
 
         for alias, canonical in self.ENTITY_ALIAS_MAP.items():
             if alias in query:
                 terms.append(canonical)
 
         if not terms:
-            terms.append(query[:24])
-        return [x for x in terms if x]
+            cleaned = query
+            for pat in [
+                "请问",
+                "对于",
+                "关于",
+                "如何",
+                "怎么",
+                "怎样",
+                "是否",
+                "能否",
+                "可以",
+                "怎么办",
+                "依据",
+                "根据",
+                "认定",
+                "处理",
+                "量刑",
+                "规定",
+                "条件",
+                "程序",
+                "吗",
+                "呢",
+                "的",
+            ]:
+                cleaned = cleaned.replace(pat, " ")
+            chunks = [x.strip() for x in re.split(r"[^一-龥0-9A-Za-z]+", cleaned) if x.strip()]
+            terms.extend([x for x in chunks if 2 <= len(x) <= 12][:2])
+        deduped: List[str] = []
+        seen = set()
+        for term in terms:
+            normalized = self._normalize_entity_term(term)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        return deduped
+
+    def _extract_target_hint_terms(self, query: str) -> List[str]:
+        query = sanitize_query_text(query)
+        hints: List[str] = []
+        hints.extend(re.findall(r"《([^》]{2,40})》", query))
+        hints.extend(re.findall(r"第[0-9一二三四五六七八九十百千万〇零两]+条", query))
+
+        for term in ["刑法", "民法典", "劳动合同法", "个人信息保护法", "正当防卫", "故意伤害", "未成年人"]:
+            if term in query:
+                hints.append(term)
+        return [self._normalize_entity_term(x) for x in hints if x]
 
     def _lookup_grounded_nodes(self, terms: List[str], per_term_limit: int = 3) -> List[Dict[str, Any]]:
         if not self.driver or not terms:
@@ -368,21 +499,24 @@ class GraphRAGRetrieval:
             normalized = self._normalize_entity_term(term)
             if not normalized:
                 continue
-            if self._is_generic_label_token(normalized):
+            if not self._is_valid_entity_term(normalized):
                 continue
             terms.append(normalized)
             alias = self.ENTITY_ALIAS_MAP.get(normalized)
-            if alias:
+            if alias and self._is_valid_entity_term(alias):
                 terms.append(alias)
 
         if not terms and allow_query_fallback:
-            terms = self._fallback_extract_entity_terms(query)
+            fallback_terms = self._fallback_extract_entity_terms(query)
+            terms = [term for term in fallback_terms if self._is_valid_entity_term(term)]
 
         dedup_terms: List[str] = []
         seen_terms = set()
         for term in terms:
             normalized = self._normalize_entity_term(term)
             if not normalized:
+                continue
+            if not self._is_valid_entity_term(normalized):
                 continue
             if normalized in seen_terms:
                 continue
@@ -413,10 +547,14 @@ class GraphRAGRetrieval:
 
     def _apply_entity_grounding(self, graph_query: GraphQuery, query: str) -> GraphQuery:
         source_ground = self._ground_entities(query, graph_query.source_entities, allow_query_fallback=True)
-        if graph_query.target_entities:
+        target_seed = graph_query.target_entities
+        if graph_query.query_type == QueryType.PATH_FINDING and not target_seed:
+            target_seed = self._extract_target_hint_terms(query)
+
+        if target_seed:
             target_ground = self._ground_entities(
                 query,
-                graph_query.target_entities,
+                target_seed,
                 allow_query_fallback=(graph_query.query_type == QueryType.PATH_FINDING),
             )
         else:

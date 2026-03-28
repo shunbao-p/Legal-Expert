@@ -85,7 +85,7 @@ class GenerationIntegrationModule:
             context_parts.append(f"{header}{content}")
         return "\n\n".join(context_parts)
 
-    def _build_prompt(self, question: str, documents: List[Document]) -> str:
+    def _build_prompt(self, question: str, documents: List[Document], answer_mode: str = "strong") -> str:
         context = self._build_context(documents)
         disclaimer_clause = (
             "最后必须保留免责声明：本回答仅供参考，不构成法律意见，需由专业法律人士复核。"
@@ -98,6 +98,19 @@ class GenerationIntegrationModule:
             if self.risk_notice_level == "light"
             else "风险提示可适当展开，但避免绝对化判断。"
         )
+        mode = (answer_mode or "strong").lower()
+        if mode == "weak":
+            mode_instruction = (
+                "当前为低置信度回答模式：结论必须写明“当前判断置信度较低，需要人工复核”，"
+                "并在适用边界中明确不确定点。"
+            )
+        elif mode == "insufficient":
+            mode_instruction = (
+                "当前为证据不足模式：结论必须写“当前检索证据不足以作出确定判断”，"
+                "并给出补充信息建议，不得输出确定性结论。"
+            )
+        else:
+            mode_instruction = "当前为正常回答模式：结论需谨慎但可给出结构化判断。"
 
         return f"""
 你是法律法规咨询助手（非律师执业意见提供者）。
@@ -120,6 +133,7 @@ class GenerationIntegrationModule:
 - 若证据不足，必须在“结论”中明确写“当前检索证据不足以作出确定判断”。
 - “依据条款”尽量列出法规名与条文编号；无法确定时明确说明“待核对原文”。
 - {risk_instruction}
+- {mode_instruction}
 - 不得给出“必然胜诉/绝对合法/绝对违法”等确定性执业结论。
 - {disclaimer_clause}
 
@@ -167,8 +181,34 @@ class GenerationIntegrationModule:
         logger.error("触发生成降级输出: %s", error)
         return self._ensure_disclaimer(answer)
 
-    def generate_adaptive_answer(self, question: str, documents: List[Document]) -> str:
-        prompt = self._build_prompt(question, documents)
+    def _build_insufficient_answer(self, question: str, documents: List[Document]) -> str:
+        answer = (
+            "结论\n"
+            "当前检索证据不足以作出确定判断。\n\n"
+            "依据条款\n"
+            "已检索到部分相关信息，但证据命中不足，需补充更具体的法规名、条文号或事实细节。\n\n"
+            "关联说明\n"
+            f"问题：{question}\n"
+            f"证据摘要：\n{self._build_evidence_summary(documents)}\n\n"
+            "适用边界\n"
+            "当前回答仅用于检索辅助，不构成法律定性意见。\n\n"
+            "风险提示\n"
+            "在证据不充分时直接采纳结论可能导致判断偏差，建议由专业法律人士复核。\n\n"
+            "免责声明\n"
+            f"{self.DISCLAIMER_TEXT}"
+        )
+        return self._ensure_disclaimer(answer)
+
+    def generate_adaptive_answer(
+        self,
+        question: str,
+        documents: List[Document],
+        answer_mode: str = "strong",
+    ) -> str:
+        if (answer_mode or "").lower() == "insufficient":
+            return self._build_insufficient_answer(question, documents)
+
+        prompt = self._build_prompt(question, documents, answer_mode=answer_mode)
         try:
             response = self._create_generation_completion(
                 messages=[{"role": "user", "content": prompt}],
@@ -181,10 +221,18 @@ class GenerationIntegrationModule:
             return self._build_degraded_answer(documents, e)
 
     def generate_adaptive_answer_stream(
-        self, question: str, documents: List[Document], max_retries: int = 1
+        self,
+        question: str,
+        documents: List[Document],
+        max_retries: int = 1,
+        answer_mode: str = "strong",
     ):
         _ = max_retries  # 保留参数以兼容历史调用签名。
-        prompt = self._build_prompt(question, documents)
+        if (answer_mode or "").lower() == "insufficient":
+            yield self._build_insufficient_answer(question, documents)
+            return
+
+        prompt = self._build_prompt(question, documents, answer_mode=answer_mode)
         try:
             response = self._create_generation_completion(
                 messages=[{"role": "user", "content": prompt}],

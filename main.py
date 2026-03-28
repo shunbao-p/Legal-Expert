@@ -22,6 +22,7 @@ from rag_modules import (
 from rag_modules.hybrid_retrieval import HybridRetrievalModule
 from rag_modules.graph_rag_retrieval import GraphRAGRetrieval
 from rag_modules.intelligent_query_router import IntelligentQueryRouter, QueryAnalysis
+from rag_modules.query_intent_template import rule_based_parse_query_intent
 from rag_modules.text_safety import sanitize_query_text, has_surrogates
 
 # 加载环境变量
@@ -37,6 +38,10 @@ def _env_or_default(name: str, default: Any, caster):
     except Exception:
         logger.warning("环境变量 %s 值非法，使用默认值: %s", name, default)
         return default
+
+
+def _to_bool(value: str) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def build_runtime_config() -> GraphRAGConfig:
@@ -68,9 +73,17 @@ def build_runtime_config() -> GraphRAGConfig:
         "CHUNK_OVERLAP": "chunk_overlap",
         "MAX_GRAPH_DEPTH": "max_graph_depth",
         "LLM_REQUEST_TIMEOUT_SECONDS": "llm_request_timeout_seconds",
+        "GRAPH_ENTITY_MAX_LEN": "graph_entity_max_len",
     }
     float_fields = {
         "TEMPERATURE": "temperature",
+        "EVIDENCE_SOFT_THRESHOLD": "evidence_soft_threshold",
+        "EVIDENCE_HARD_THRESHOLD": "evidence_hard_threshold",
+    }
+    bool_fields = {
+        "INTENT_ENABLED": "intent_enabled",
+        "RERANK_ENABLED": "rerank_enabled",
+        "EVIDENCE_GATE_ENABLED": "evidence_gate_enabled",
     }
 
     for env_name, key in str_fields.items():
@@ -79,6 +92,8 @@ def build_runtime_config() -> GraphRAGConfig:
         base[key] = _env_or_default(env_name, base[key], int)
     for env_name, key in float_fields.items():
         base[key] = _env_or_default(env_name, base[key], float)
+    for env_name, key in bool_fields.items():
+        base[key] = _env_or_default(env_name, base[key], _to_bool)
 
     # 历史兼容：若仅设置了 LLM_MODEL，则视为生成主模型配置。
     legacy_llm_model = os.getenv("LLM_MODEL")
@@ -307,6 +322,102 @@ class AdvancedGraphRAGSystem:
         if domains:
             top_domains = list(domains.keys())[:10]
             print(f"   主要法律领域: {', '.join(top_domains)}")
+
+    def _evaluate_evidence_mode(self, documents: List, question: str) -> Dict[str, Any]:
+        def _derive_must_signal_from_question(top_document) -> Dict[str, Any]:
+            intent = rule_based_parse_query_intent(question)
+            must_terms = [str(x).strip().lower() for x in (intent.must_terms or []) if str(x).strip()]
+            if not must_terms:
+                return {"has_signal": False, "hit_count": 0, "hit_ratio": 0.0, "must_terms": []}
+
+            md = top_document.metadata or {}
+            joined_text = " ".join(
+                [
+                    str(top_document.page_content or ""),
+                    str(md.get("display_title", "") or ""),
+                    str(md.get("law_name", "") or ""),
+                    str(md.get("article_title", "") or ""),
+                    str(md.get("article_id", "") or ""),
+                ]
+            ).lower()
+            hit_count = sum(1 for term in must_terms if term and term in joined_text)
+            hit_ratio = (hit_count / float(len(must_terms))) if must_terms else 0.0
+            return {
+                "has_signal": True,
+                "hit_count": int(hit_count),
+                "hit_ratio": float(hit_ratio),
+                "must_terms": must_terms,
+            }
+
+        default = {
+            "mode": "strong",
+            "reason": "gate_disabled_or_sufficient",
+            "top_rerank_score": 0.0,
+            "top_must_hit_count": 0,
+        }
+        if not documents:
+            default.update({"mode": "insufficient", "reason": "empty_documents"})
+            return default
+        if not bool(getattr(self.config, "evidence_gate_enabled", True)):
+            return default
+
+        top_doc = documents[0]
+        metadata = top_doc.metadata or {}
+        top_rerank_score = float(
+            metadata.get(
+                "rerank_score",
+                metadata.get("final_score", metadata.get("relevance_score", 0.0)),
+            )
+            or 0.0
+        )
+        top_must_hit_count = int(metadata.get("must_terms_hit_count", 0) or 0)
+        has_must_signal = "must_terms_hit_count" in metadata or "must_terms" in metadata
+        top_must_total = len(metadata.get("must_terms", []) or [])
+        soft_threshold = float(getattr(self.config, "evidence_soft_threshold", 0.5))
+        hard_threshold = float(getattr(self.config, "evidence_hard_threshold", 0.5))
+
+        if not has_must_signal:
+            derived = _derive_must_signal_from_question(top_doc)
+            has_must_signal = bool(derived.get("has_signal", False))
+            top_must_hit_count = int(derived.get("hit_count", 0))
+            metadata["must_terms_hit_count"] = top_must_hit_count
+            metadata["must_terms_hit_ratio"] = round(float(derived.get("hit_ratio", 0.0)), 4)
+            metadata["must_terms"] = derived.get("must_terms", [])
+            top_must_total = len(metadata.get("must_terms", []) or [])
+            top_doc.metadata = metadata
+            if not has_must_signal:
+                return {
+                    "mode": "weak",
+                    "reason": "missing_must_signal_no_terms",
+                    "top_rerank_score": round(top_rerank_score, 4),
+                    "top_must_hit_count": top_must_hit_count,
+                }
+
+        if top_must_hit_count == 0 and top_rerank_score < hard_threshold:
+            return {
+                "mode": "insufficient",
+                "reason": "hard_gate_no_must_hit_and_low_rerank",
+                "top_rerank_score": round(top_rerank_score, 4),
+                "top_must_hit_count": top_must_hit_count,
+            }
+        required_hits = 1 if top_must_total <= 1 else 2
+        if top_must_hit_count < required_hits:
+            reason = "soft_gate_low_must_hit"
+            if top_rerank_score < soft_threshold:
+                reason = "soft_gate_low_must_hit_and_low_rerank"
+            return {
+                "mode": "weak",
+                "reason": reason,
+                "top_rerank_score": round(top_rerank_score, 4),
+                "top_must_hit_count": top_must_hit_count,
+            }
+        return {
+            "mode": "strong",
+            "reason": "sufficient_hits",
+            "top_rerank_score": round(top_rerank_score, 4),
+            "top_must_hit_count": top_must_hit_count,
+            "question": question,
+        }
     
     def ask_question_with_routing(self, question: str, stream: bool = False, explain_routing: bool = False):
         """
@@ -369,13 +480,28 @@ class AdvancedGraphRAGSystem:
             else:
                 # 保持返回值签名一致：始终返回 (result, analysis)
                 return "抱歉，没有找到相关的法律法规信息。请尝试换一种问法。", analysis
+
+            evidence_state = self._evaluate_evidence_mode(relevant_docs, safe_question)
+            print(
+                "🧪 证据评估: mode=%s, reason=%s, rerank=%.3f, must_hit=%s"
+                % (
+                    evidence_state.get("mode", "strong"),
+                    evidence_state.get("reason", "unknown"),
+                    float(evidence_state.get("top_rerank_score", 0.0)),
+                    evidence_state.get("top_must_hit_count", 0),
+                )
+            )
             
             # 4. 生成回答
             print("🎯 智能生成回答...")
             
             if stream:
                 try:
-                    for chunk_text in self.generation_module.generate_adaptive_answer_stream(safe_question, relevant_docs):
+                    for chunk_text in self.generation_module.generate_adaptive_answer_stream(
+                        safe_question,
+                        relevant_docs,
+                        answer_mode=evidence_state.get("mode", "strong"),
+                    ):
                         print(chunk_text, end="", flush=True)
                     print("\n")
                     result = "流式输出完成"
@@ -383,9 +509,17 @@ class AdvancedGraphRAGSystem:
                     logger.error(f"流式输出过程中出现错误: {stream_error}")
                     print(f"\n⚠️ 流式输出中断，切换到标准模式...")
                     # 使用非流式作为后备
-                    result = self.generation_module.generate_adaptive_answer(safe_question, relevant_docs)
+                    result = self.generation_module.generate_adaptive_answer(
+                        safe_question,
+                        relevant_docs,
+                        answer_mode=evidence_state.get("mode", "strong"),
+                    )
             else:
-                result = self.generation_module.generate_adaptive_answer(safe_question, relevant_docs)
+                result = self.generation_module.generate_adaptive_answer(
+                    safe_question,
+                    relevant_docs,
+                    answer_mode=evidence_state.get("mode", "strong"),
+                )
             
             # 5. 性能统计
             end_time = time.time()

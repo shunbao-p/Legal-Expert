@@ -38,6 +38,12 @@ class GraphRAGConfig:
 
     # 检索配置（LightRAG Round-robin策略）
     top_k: int = 5
+    intent_enabled: bool = True
+    rerank_enabled: bool = True
+    evidence_gate_enabled: bool = True
+    evidence_soft_threshold: float = 0.5
+    evidence_hard_threshold: float = 0.5
+    graph_entity_max_len: int = 20
 
     # 生成配置
     temperature: float = 0.1
@@ -107,6 +113,12 @@ class GraphRAGConfig:
             'llm_assist_backup_provider': self.llm_assist_backup_provider,
             'llm_assist_backup_model': self.llm_assist_backup_model,
             'top_k': self.top_k,
+            'intent_enabled': self.intent_enabled,
+            'rerank_enabled': self.rerank_enabled,
+            'evidence_gate_enabled': self.evidence_gate_enabled,
+            'evidence_soft_threshold': self.evidence_soft_threshold,
+            'evidence_hard_threshold': self.evidence_hard_threshold,
+            'graph_entity_max_len': self.graph_entity_max_len,
 
             'temperature': self.temperature,
             'max_tokens': self.max_tokens,
