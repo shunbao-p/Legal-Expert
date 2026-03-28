@@ -351,7 +351,8 @@ class AdvancedGraphRAGSystem:
                 doc_info = []
                 for doc in relevant_docs:
                     display_title = (
-                        doc.metadata.get("law_name")
+                        doc.metadata.get("display_title")
+                        or doc.metadata.get("law_name")
                         or doc.metadata.get("article_title")
                         or doc.metadata.get("recipe_name")
                         or "未知内容"

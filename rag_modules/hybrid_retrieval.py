@@ -45,6 +45,127 @@ class HybridRetrievalModule:
         self.bm25_retriever = None
         self.graph_indexing = GraphIndexingModule(config, llm_client, llm_dispatcher=llm_dispatcher)
         self.graph_indexed = False
+        # 统一分数契约（0~1，越大越相关）与融合权重
+        self.entity_weight = 0.4
+        self.topic_weight = 0.2
+        self.vector_weight = 0.4
+        self.min_final_score = 0.2
+
+    @staticmethod
+    def _clamp_01(value: Any) -> float:
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except Exception:
+            return 0.0
+
+    def _normalize_fulltext_score(self, raw_score: Any) -> float:
+        """将 Neo4j fulltext 原始分映射到 0~1。"""
+        try:
+            score = float(raw_score)
+        except Exception:
+            return 0.0
+        if score <= 0:
+            return 0.0
+        return self._clamp_01(score / (score + 1.0))
+
+    def _normalize_vector_score(self, raw_score: Any) -> float:
+        """
+        统一向量分语义：越大越相关，最终映射到 0~1。
+        - score <= 0 统一视为无效相似度（0）
+        - score 在 (0, 1] 直接使用
+        - score > 1 截断为 1（异常尺度保护）
+        """
+        try:
+            score = float(raw_score)
+        except Exception:
+            return 0.0
+        if score <= 0:
+            return 0.0
+        if score <= 1.0:
+            return self._clamp_01(score)
+        return 1.0
+
+    def _estimate_entity_relevance(self, entity_name: str, index_keys: List[str], keyword: str) -> float:
+        name = (entity_name or "").lower()
+        kw = (keyword or "").lower().strip()
+        if not kw:
+            return 0.45
+        score = 0.45
+        if name == kw:
+            score += 0.35
+        elif kw in name or name in kw:
+            score += 0.25
+        if any(kw in (k or "").lower() or (k or "").lower() in kw for k in (index_keys or [])):
+            score += 0.15
+        if re.search(r"第[0-9一二三四五六七八九十百千]+条", kw):
+            score += 0.05
+        return self._clamp_01(score)
+
+    def _estimate_topic_relevance(
+        self,
+        keyword: str,
+        relation_type: str = "",
+        law_name: str = "",
+        article_title: str = "",
+        legal_domain: str = "",
+        content: str = "",
+    ) -> float:
+        kw = (keyword or "").lower().strip()
+        score = 0.35
+        if not kw:
+            return score
+        if kw in (law_name or "").lower():
+            score += 0.20
+        if kw in (article_title or "").lower():
+            score += 0.20
+        if kw in (legal_domain or "").lower():
+            score += 0.20
+        if kw and kw in (content or "").lower():
+            score += 0.15
+        if relation_type in {"CITES", "RELATES_TO", "APPLIES_TO"}:
+            score += 0.05
+        return self._clamp_01(score)
+
+    def _apply_result_contract(self, doc: Document) -> Document:
+        """
+        统一展示字段契约，避免“未知内容”由 metadata 缺失引起。
+        """
+        md = doc.metadata or {}
+        node_type = str(md.get("node_type", ""))
+        entity_name = str(md.get("entity_name", ""))
+        law_name = str(md.get("law_name", "") or "")
+        article_title = str(md.get("article_title", "") or "")
+        article_id = str(md.get("article_id", "") or "")
+
+        if not law_name and node_type == "LawDocument" and entity_name:
+            law_name = entity_name
+        if not article_title and node_type == "Article":
+            article_title = entity_name or article_id
+
+        fallback_title = ""
+        if not fallback_title and doc.page_content:
+            first_line = doc.page_content.strip().splitlines()[0] if doc.page_content.strip() else ""
+            fallback_title = first_line[:60]
+
+        display_title = (
+            str(md.get("display_title", "") or "")
+            or law_name
+            or article_title
+            or entity_name
+            or article_id
+            or fallback_title
+            or "未知内容"
+        )
+        md.update(
+            {
+                "law_name": law_name,
+                "article_title": article_title,
+                "article_id": article_id,
+                "display_title": display_title,
+            }
+        )
+        doc.metadata = md
+        return doc
 
     def _assist_chat_completion(self, messages: List[Dict[str, str]], max_tokens: int = 500):
         if self.llm_dispatcher is not None:
@@ -210,11 +331,18 @@ class HybridRetrievalModule:
                         content=content,
                         node_id=node_id,
                         node_type=entity.entity_type,
-                        relevance_score=0.92,
+                        relevance_score=self._estimate_entity_relevance(
+                            entity_name=entity.entity_name,
+                            index_keys=entity.index_keys,
+                            keyword=keyword,
+                        ),
                         retrieval_level="entity",
                         metadata={
                             "entity_name": entity.entity_name,
                             "entity_type": entity.entity_type,
+                            "law_name": entity.entity_name if entity.entity_type == "LawDocument" else "",
+                            "article_title": entity.entity_name if entity.entity_type == "Article" else "",
+                            "article_id": str(entity.metadata.get("properties", {}).get("articleId", "")),
                             "matched_keyword": keyword,
                             "index_keys": entity.index_keys,
                         },
@@ -240,6 +368,7 @@ class HybridRetrievalModule:
             COALESCE(node.articleId, '') AS article_id,
             COALESCE(node.title, '') AS article_title,
             COALESCE(node.content, node.description, '') AS content,
+            keyword AS matched_keyword,
             score
         ORDER BY score DESC
         LIMIT $limit
@@ -263,12 +392,15 @@ class HybridRetrievalModule:
                             content=content,
                             node_id=record["node_id"],
                             node_type=node_type,
-                            relevance_score=float(record["score"]) * 0.8,
+                            relevance_score=self._normalize_fulltext_score(record["score"]),
                             retrieval_level="entity",
                             metadata={
                                 "law_name": record["display_name"] if node_type == "LawDocument" else "",
                                 "article_id": record["article_id"],
                                 "article_title": record["article_title"],
+                                "entity_name": record["display_name"],
+                                "matched_keyword": record["matched_keyword"],
+                                "raw_score": record["score"],
                                 "source": "neo4j_fulltext",
                             },
                         )
@@ -297,12 +429,19 @@ class HybridRetrievalModule:
                         content=content,
                         node_id=relation.source_entity,
                         node_type=source.entity_type,
-                        relevance_score=0.9,
+                        relevance_score=self._estimate_topic_relevance(
+                            keyword=keyword,
+                            relation_type=relation.relation_type,
+                            law_name=source.entity_name if source.entity_type == "LawDocument" else "",
+                            article_title=source.metadata.get("properties", {}).get("title", ""),
+                        ),
                         retrieval_level="topic",
                         metadata={
                             "relation_type": relation.relation_type,
                             "law_name": source.entity_name if source.entity_type == "LawDocument" else "",
                             "article_id": source.metadata.get("properties", {}).get("articleId", ""),
+                            "article_title": source.metadata.get("properties", {}).get("title", ""),
+                            "entity_name": source.entity_name,
                             "matched_keyword": keyword,
                             "source": "graph_relation",
                         },
@@ -330,7 +469,8 @@ class HybridRetrievalModule:
             COALESCE(a.articleId, '') AS article_id,
             COALESCE(a.title, '') AS article_title,
             COALESCE(d.name, '') AS legal_domain,
-            COALESCE(a.content, '') AS content
+            COALESCE(a.content, '') AS content,
+            keyword AS matched_keyword
         LIMIT $limit
         """
         try:
@@ -347,13 +487,20 @@ class HybridRetrievalModule:
                             content=text,
                             node_id=record["node_id"],
                             node_type="Article",
-                            relevance_score=0.78,
+                            relevance_score=self._estimate_topic_relevance(
+                                keyword=record["matched_keyword"],
+                                law_name=record["law_name"],
+                                article_title=record["article_title"],
+                                legal_domain=record["legal_domain"],
+                                content=record["content"],
+                            ),
                             retrieval_level="topic",
                             metadata={
                                 "law_name": record["law_name"],
                                 "article_id": record["article_id"],
                                 "article_title": record["article_title"],
                                 "legal_domain": record["legal_domain"],
+                                "matched_keyword": record["matched_keyword"],
                                 "source": "neo4j_topic",
                             },
                         )
@@ -371,11 +518,12 @@ class HybridRetrievalModule:
         entity_results = self.entity_level_retrieval(entity_keywords, top_k)
         topic_results = self.topic_level_retrieval(topic_keywords, top_k)
 
-        all_results = self._dedup_results(entity_results + topic_results)
+        # 这里不能跨 retrieval_level 去重，否则同一节点的“实体+主题”双信号会被截断。
+        all_results = entity_results + topic_results
         all_results.sort(key=lambda x: x.relevance_score, reverse=True)
 
         documents: List[Document] = []
-        for result in all_results[:top_k]:
+        for result in all_results[: top_k * 2]:
             documents.append(
                 Document(
                     page_content=result.content,
@@ -420,8 +568,8 @@ class HybridRetrievalModule:
                         "score": result.get("score", 0.0),
                     },
                 )
-                enhanced_docs.append(doc)
-            return enhanced_docs[:top_k]
+                enhanced_docs.append(self._apply_result_contract(doc))
+            return enhanced_docs[: top_k * 2]
         except Exception as e:
             logger.error("向量增强检索失败: %s", e)
             return []
@@ -449,39 +597,83 @@ class HybridRetrievalModule:
             return []
 
     def hybrid_search(self, query: str, top_k: int = 5) -> List[Document]:
-        """Round-robin 混合实体/主题/向量结果。"""
+        """统一契约融合：字段统一 + 分数统一 + 加权排序。"""
         query = sanitize_query_text(query)
         if not query:
             return []
 
         dual_docs = self.dual_level_retrieval(query, top_k)
         vector_docs = self.vector_search_enhanced(query, top_k)
+        candidates: Dict[str, Dict[str, Any]] = {}
 
-        merged_docs: List[Document] = []
-        seen_doc_ids = set()
-        max_len = max(len(dual_docs), len(vector_docs))
-        for i in range(max_len):
-            if i < len(dual_docs):
-                doc = dual_docs[i]
-                doc_id = doc.metadata.get("node_id", hash(doc.page_content))
-                if doc_id not in seen_doc_ids:
-                    seen_doc_ids.add(doc_id)
-                    doc.metadata["search_method"] = "dual_level"
-                    doc.metadata["final_score"] = doc.metadata.get("relevance_score", 0.0)
-                    merged_docs.append(doc)
+        def doc_key(doc: Document) -> str:
+            node_id = str(doc.metadata.get("node_id", "")).strip()
+            if node_id:
+                return node_id
+            return str(hash(doc.page_content[:200]))
 
-            if i < len(vector_docs):
-                doc = vector_docs[i]
-                doc_id = doc.metadata.get("node_id", hash(doc.page_content))
-                if doc_id not in seen_doc_ids:
-                    seen_doc_ids.add(doc_id)
-                    vector_score = doc.metadata.get("score", 0.0)
-                    similarity_score = max(0.0, 1.0 - vector_score) if vector_score <= 1.0 else 0.0
-                    doc.metadata["search_method"] = "vector_enhanced"
-                    doc.metadata["final_score"] = similarity_score
-                    merged_docs.append(doc)
+        def ensure_candidate(key: str, doc: Document) -> Dict[str, Any]:
+            if key not in candidates:
+                candidates[key] = {
+                    "doc": self._apply_result_contract(doc),
+                    "entity_score": 0.0,
+                    "topic_score": 0.0,
+                    "vector_score": 0.0,
+                }
+            return candidates[key]
 
-        return merged_docs[:top_k]
+        for doc in dual_docs:
+            doc = self._apply_result_contract(doc)
+            key = doc_key(doc)
+            candidate = ensure_candidate(key, doc)
+            raw_score = self._clamp_01(doc.metadata.get("relevance_score", 0.0))
+            level = doc.metadata.get("retrieval_level", "")
+            if level == "entity":
+                candidate["entity_score"] = max(candidate["entity_score"], raw_score)
+            elif level == "topic":
+                candidate["topic_score"] = max(candidate["topic_score"], raw_score)
+            else:
+                candidate["topic_score"] = max(candidate["topic_score"], raw_score)
+            candidate["doc"] = self._apply_result_contract(candidate["doc"])
+
+        for doc in vector_docs:
+            doc = self._apply_result_contract(doc)
+            key = doc_key(doc)
+            candidate = ensure_candidate(key, doc)
+            vector_score = self._normalize_vector_score(doc.metadata.get("score", 0.0))
+            candidate["vector_score"] = max(candidate["vector_score"], vector_score)
+            if not candidate["doc"].metadata.get("law_name") and doc.metadata.get("law_name"):
+                candidate["doc"] = doc
+            candidate["doc"] = self._apply_result_contract(candidate["doc"])
+
+        ranked_docs: List[Document] = []
+        for candidate in candidates.values():
+            doc = candidate["doc"]
+            entity_score = candidate["entity_score"]
+            topic_score = candidate["topic_score"]
+            vector_score = candidate["vector_score"]
+            final_score = (
+                self.entity_weight * entity_score
+                + self.topic_weight * topic_score
+                + self.vector_weight * vector_score
+            )
+            doc.metadata.update(
+                {
+                    "search_method": "contract_fusion",
+                    "score_entity": round(entity_score, 4),
+                    "score_topic": round(topic_score, 4),
+                    "score_vector": round(vector_score, 4),
+                    "final_score": round(self._clamp_01(final_score), 4),
+                    "score_contract": "final=0.4*entity+0.2*topic+0.4*vector",
+                }
+            )
+            ranked_docs.append(doc)
+
+        ranked_docs.sort(key=lambda x: x.metadata.get("final_score", 0.0), reverse=True)
+        filtered_docs = [d for d in ranked_docs if d.metadata.get("final_score", 0.0) >= self.min_final_score]
+        if filtered_docs:
+            return filtered_docs[:top_k]
+        return ranked_docs[:top_k]
 
     def _dedup_results(self, results: List[RetrievalResult]) -> List[RetrievalResult]:
         deduped: List[RetrievalResult] = []

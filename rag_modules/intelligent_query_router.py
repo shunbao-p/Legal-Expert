@@ -192,13 +192,19 @@ class IntelligentQueryRouter:
                 not documents
                 and analysis.recommended_strategy in {SearchStrategy.GRAPH_RAG, SearchStrategy.COMBINED}
             ):
+                graph_empty_reason = getattr(self.graph_rag_retrieval, "last_empty_reason", "empty_result")
+                grounding_stats = getattr(self.graph_rag_retrieval, "last_grounding_stats", {}) or {}
                 logger.warning(
-                    "路由策略 %s 返回空结果，自动降级到传统检索",
+                    "路由策略 %s 返回空结果，自动降级到传统检索: reason=%s",
                     analysis.recommended_strategy.value,
+                    graph_empty_reason,
                 )
                 documents = self.traditional_retrieval.hybrid_search(query, top_k)
                 for doc in documents:
                     doc.metadata["route_fallback"] = "empty_result_to_traditional"
+                    doc.metadata["graph_empty_reason"] = graph_empty_reason
+                    doc.metadata["graph_grounding_candidates"] = grounding_stats.get("source_candidates", [])
+                    doc.metadata["graph_grounding_hit_count"] = grounding_stats.get("source_hit_count", 0)
 
             return self._post_process_results(documents, analysis), analysis
         except Exception as e:
