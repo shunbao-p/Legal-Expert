@@ -8,7 +8,7 @@
 
 import json
 import logging
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
 
@@ -38,17 +38,42 @@ class QueryAnalysis:
 class IntelligentQueryRouter:
     """法律场景智能查询路由。"""
 
-    def __init__(self, traditional_retrieval, graph_rag_retrieval, llm_client, config):
+    def __init__(
+        self,
+        traditional_retrieval,
+        graph_rag_retrieval,
+        llm_client,
+        config,
+        llm_dispatcher: Optional[object] = None,
+    ):
         self.traditional_retrieval = traditional_retrieval
         self.graph_rag_retrieval = graph_rag_retrieval
         self.llm_client = llm_client
         self.config = config
+        self.llm_dispatcher = llm_dispatcher
         self.route_stats = {
             "traditional_count": 0,
             "graph_rag_count": 0,
             "combined_count": 0,
             "total_queries": 0,
         }
+
+    def _assist_chat_completion(self, messages: List[Dict[str, str]], max_tokens: int = 500):
+        if self.llm_dispatcher is not None:
+            response, provider, model = self.llm_dispatcher.create_chat_completion(
+                role="assist",
+                messages=messages,
+                temperature=0.1,
+                max_tokens=max_tokens,
+            )
+            logger.info("辅助调用通道(路由): provider=%s model=%s", provider, model)
+            return response
+        return self.llm_client.chat.completions.create(
+            model=self.config.llm_model,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=max_tokens,
+        )
 
     def analyze_query(self, query: str) -> QueryAnalysis:
         query = sanitize_query_text(query)
@@ -84,10 +109,8 @@ class IntelligentQueryRouter:
         }}
         """
         try:
-            response = self.llm_client.chat.completions.create(
-                model=self.config.llm_model,
+            response = self._assist_chat_completion(
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
                 max_tokens=500,
             )
             data = self._safe_json_loads(response.choices[0].message.content.strip())

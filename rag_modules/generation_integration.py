@@ -4,8 +4,7 @@
 
 import logging
 import os
-import time
-from typing import List
+from typing import List, Optional
 
 from openai import OpenAI
 from langchain_core.documents import Document
@@ -25,19 +24,46 @@ class GenerationIntegrationModule:
         max_tokens: int = 2048,
         enable_legal_disclaimer: bool = True,
         risk_notice_level: str = "light",
+        llm_dispatcher: Optional[object] = None,
     ):
         self.model_name = model_name
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.enable_legal_disclaimer = enable_legal_disclaimer
         self.risk_notice_level = risk_notice_level
+        self.llm_dispatcher = llm_dispatcher
 
+        # 向后兼容：保留直接Kimi客户端能力，供未接入调度层的调用路径使用。
+        self.client = None
         api_key = os.getenv("MOONSHOT_API_KEY")
-        if not api_key:
-            raise ValueError("请设置 MOONSHOT_API_KEY 环境变量")
+        if api_key:
+            self.client = OpenAI(api_key=api_key, base_url="https://api.moonshot.cn/v1")
 
-        self.client = OpenAI(api_key=api_key, base_url="https://api.moonshot.cn/v1")
-        logger.info(f"生成模块初始化完成，模型: {model_name}")
+        if self.llm_dispatcher is None and self.client is None:
+            raise ValueError("请设置 MOONSHOT_API_KEY 环境变量，或接入 llm_dispatcher")
+
+        logger.info("生成模块初始化完成，模型: %s, dispatcher=%s", model_name, bool(self.llm_dispatcher))
+
+    def _create_generation_completion(self, messages, stream: bool = False, timeout: Optional[int] = None):
+        if self.llm_dispatcher is not None:
+            response, provider, model = self.llm_dispatcher.create_chat_completion(
+                role="generation",
+                messages=messages,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                stream=stream,
+                timeout=timeout,
+            )
+            logger.info("生成调用通道: provider=%s model=%s stream=%s", provider, model, stream)
+            return response
+        return self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            stream=stream,
+            timeout=timeout,
+        )
 
     def _build_context(self, documents: List[Document]) -> str:
         context_parts: List[str] = []
@@ -116,67 +142,69 @@ class GenerationIntegrationModule:
         logger.warning("模型输出未命中免责声明，已自动追加 disclaimer_appended=true")
         return f"{text.rstrip()}\n\n{self.DISCLAIMER_TEXT}"
 
+    def _build_evidence_summary(self, documents: List[Document], limit: int = 3) -> str:
+        if not documents:
+            return "- 无可用检索证据。"
+        lines: List[str] = []
+        for doc in documents[:limit]:
+            law_name = doc.metadata.get("law_name") or "未标注法规"
+            article_id = doc.metadata.get("article_id") or "条文号未知"
+            snippet = (doc.page_content or "").strip().replace("\n", " ")
+            if len(snippet) > 120:
+                snippet = f"{snippet[:120]}..."
+            lines.append(f"- {law_name} / {article_id}: {snippet or '无正文片段'}")
+        return "\n".join(lines)
+
+    def _build_degraded_answer(self, documents: List[Document], error: Exception) -> str:
+        answer = (
+            "结论\n"
+            "当前生成通道暂时不可用，已返回检索证据摘要供人工复核。\n\n"
+            "已检索证据摘要\n"
+            f"{self._build_evidence_summary(documents)}\n\n"
+            "建议\n"
+            "请稍后重试，或由专业法律人士结合原文进一步确认。"
+        )
+        logger.error("触发生成降级输出: %s", error)
+        return self._ensure_disclaimer(answer)
+
     def generate_adaptive_answer(self, question: str, documents: List[Document]) -> str:
         prompt = self._build_prompt(question, documents)
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
+            response = self._create_generation_completion(
                 messages=[{"role": "user", "content": prompt}],
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
+                stream=False,
+                timeout=60,
             )
             raw_answer = response.choices[0].message.content.strip()
             return self._ensure_disclaimer(raw_answer)
         except Exception as e:
-            logger.error(f"答案生成失败: {e}")
-            return f"抱歉，生成回答时出现错误：{str(e)}"
+            return self._build_degraded_answer(documents, e)
 
     def generate_adaptive_answer_stream(
-        self, question: str, documents: List[Document], max_retries: int = 3
+        self, question: str, documents: List[Document], max_retries: int = 1
     ):
+        _ = max_retries  # 保留参数以兼容历史调用签名。
         prompt = self._build_prompt(question, documents)
-        for attempt in range(max_retries):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    stream=True,
-                    timeout=60,
-                )
+        try:
+            response = self._create_generation_completion(
+                messages=[{"role": "user", "content": prompt}],
+                stream=True,
+                timeout=60,
+            )
+            print("开始流式生成回答...\n")
 
-                if attempt == 0:
-                    print("开始流式生成回答...\n")
-                else:
-                    print(f"第{attempt + 1}次尝试流式生成...\n")
+            full_response = ""
+            for chunk in response:
+                if chunk.choices[0].delta.content:
+                    delta = chunk.choices[0].delta.content
+                    full_response += delta
+                    yield delta
 
-                full_response = ""
-                for chunk in response:
-                    if chunk.choices[0].delta.content:
-                        delta = chunk.choices[0].delta.content
-                        full_response += delta
-                        yield delta
-
-                # 流式收敛后做免责声明后校验，若缺失自动补全
-                if self.enable_legal_disclaimer and not self._has_disclaimer(full_response):
-                    logger.warning("流式输出未命中免责声明，已自动追加 disclaimer_appended=true")
-                    yield f"\n\n{self.DISCLAIMER_TEXT}"
-                return
-
-            except Exception as e:
-                logger.warning(f"流式生成第{attempt + 1}次尝试失败: {e}")
-                if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 2
-                    print(f"⚠️ 连接中断，{wait_time}秒后重试...")
-                    time.sleep(wait_time)
-                    continue
-                logger.error("流式生成完全失败，尝试非流式后备方案")
-                print("⚠️ 流式生成失败，切换到标准模式...")
-                try:
-                    yield self.generate_adaptive_answer(question, documents)
-                    return
-                except Exception as fallback_error:
-                    logger.error(f"后备生成也失败: {fallback_error}")
-                    yield f"抱歉，生成回答时出现网络错误，请稍后重试。错误信息：{str(e)}"
-                    return
+            # 流式收敛后做免责声明后校验，若缺失自动补全
+            if self.enable_legal_disclaimer and not self._has_disclaimer(full_response):
+                logger.warning("流式输出未命中免责声明，已自动追加 disclaimer_appended=true")
+                yield f"\n\n{self.DISCLAIMER_TEXT}"
+            return
+        except Exception as e:
+            yield self._build_degraded_answer(documents, e)
+            return

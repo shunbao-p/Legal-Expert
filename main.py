@@ -1,27 +1,8 @@
-# =============================================================
-# 文件介绍：图 RAG 系统主程序（C9 进阶实战）
-# 目标：在 C8 基础 RAG 之上，引入知识图谱，构建「传统混合检索 + 图 RAG」双引擎智能问答系统。
-# 思路：
-#   C9 相比 C8 新增三个核心能力：
-#     1. 图数据准备（GraphDataPreparationModule）：
-#        从食谱中抽取实体关系，构建 Neo4j 知识图谱
-#     2. 图 RAG 检索（GraphRAGRetrieval）：
-#        支持多跳图遍历（找关联法条/风险场景）、子图提取、实体关系推理
-#     3. 智能查询路由（IntelligentQueryRouter）：
-#        分析查询复杂度和关系密集度，自动决策使用「传统检索」「图检索」或「组合策略」
-#   IntelligentQueryRouter 是本章最核心的模块，体现了 Agentic RAG 的思想：
-#   系统具备元认知能力，能根据问题特征动态选择最优策略。
-# =============================================================
-"""
-基于图RAG的法律法规咨询助手 - 主程序
-整合传统检索和图RAG检索，实现法律场景下的图数据优势
-"""
-
 import os
 import sys
 import time
 import logging
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -35,7 +16,8 @@ from config import DEFAULT_CONFIG, GraphRAGConfig
 from rag_modules import (
     GraphDataPreparationModule,
     MilvusIndexConstructionModule, 
-    GenerationIntegrationModule
+    GenerationIntegrationModule,
+    MultiLLMDispatcher,
 )
 from rag_modules.hybrid_retrieval import HybridRetrievalModule
 from rag_modules.graph_rag_retrieval import GraphRAGRetrieval
@@ -44,6 +26,70 @@ from rag_modules.text_safety import sanitize_query_text, has_surrogates
 
 # 加载环境变量
 load_dotenv()
+
+
+def _env_or_default(name: str, default: Any, caster):
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        return caster(value)
+    except Exception:
+        logger.warning("环境变量 %s 值非法，使用默认值: %s", name, default)
+        return default
+
+
+def build_runtime_config() -> GraphRAGConfig:
+    base: Dict[str, Any] = DEFAULT_CONFIG.to_dict()
+    str_fields = {
+        "NEO4J_URI": "neo4j_uri",
+        "NEO4J_USER": "neo4j_user",
+        "NEO4J_PASSWORD": "neo4j_password",
+        "NEO4J_DATABASE": "neo4j_database",
+        "MILVUS_HOST": "milvus_host",
+        "MILVUS_COLLECTION_NAME": "milvus_collection_name",
+        "EMBEDDING_MODEL": "embedding_model",
+        "LLM_MODEL": "llm_model",
+        "LLM_GENERATION_PRIMARY_PROVIDER": "llm_generation_primary_provider",
+        "LLM_GENERATION_PRIMARY_MODEL": "llm_generation_primary_model",
+        "LLM_GENERATION_BACKUP_PROVIDER": "llm_generation_backup_provider",
+        "LLM_GENERATION_BACKUP_MODEL": "llm_generation_backup_model",
+        "LLM_ASSIST_PRIMARY_PROVIDER": "llm_assist_primary_provider",
+        "LLM_ASSIST_PRIMARY_MODEL": "llm_assist_primary_model",
+        "LLM_ASSIST_BACKUP_PROVIDER": "llm_assist_backup_provider",
+        "LLM_ASSIST_BACKUP_MODEL": "llm_assist_backup_model",
+    }
+    int_fields = {
+        "MILVUS_PORT": "milvus_port",
+        "MILVUS_DIMENSION": "milvus_dimension",
+        "TOP_K": "top_k",
+        "MAX_TOKENS": "max_tokens",
+        "CHUNK_SIZE": "chunk_size",
+        "CHUNK_OVERLAP": "chunk_overlap",
+        "MAX_GRAPH_DEPTH": "max_graph_depth",
+        "LLM_REQUEST_TIMEOUT_SECONDS": "llm_request_timeout_seconds",
+    }
+    float_fields = {
+        "TEMPERATURE": "temperature",
+    }
+
+    for env_name, key in str_fields.items():
+        base[key] = _env_or_default(env_name, base[key], str)
+    for env_name, key in int_fields.items():
+        base[key] = _env_or_default(env_name, base[key], int)
+    for env_name, key in float_fields.items():
+        base[key] = _env_or_default(env_name, base[key], float)
+
+    # 历史兼容：若仅设置了 LLM_MODEL，则视为生成主模型配置。
+    legacy_llm_model = os.getenv("LLM_MODEL")
+    new_generation_model = os.getenv("LLM_GENERATION_PRIMARY_MODEL")
+    if legacy_llm_model and not new_generation_model:
+        base["llm_generation_primary_model"] = legacy_llm_model
+        base["llm_model"] = legacy_llm_model
+    elif new_generation_model:
+        base["llm_model"] = base["llm_generation_primary_model"]
+
+    return GraphRAGConfig.from_dict(base)
 
 class AdvancedGraphRAGSystem:
     """
@@ -58,12 +104,13 @@ class AdvancedGraphRAGSystem:
     """
     
     def __init__(self, config: Optional[GraphRAGConfig] = None):
-        self.config = config or DEFAULT_CONFIG
+        self.config = config or build_runtime_config()
         
         # 核心模块
         self.data_module = None
         self.index_module = None
         self.generation_module = None
+        self.llm_dispatcher = None
         
         # 检索引擎
         self.traditional_retrieval = None
@@ -98,13 +145,21 @@ class AdvancedGraphRAGSystem:
             )
             
             # 3. 生成模块
+            print("初始化LLM调度层...")
+            try:
+                self.llm_dispatcher = MultiLLMDispatcher(self.config)
+            except Exception as dispatcher_error:
+                self.llm_dispatcher = None
+                logger.warning("LLM调度层初始化失败，回退单通道: %s", dispatcher_error)
+
             print("初始化生成模块...")
             self.generation_module = GenerationIntegrationModule(
-                model_name=self.config.llm_model,
+                model_name=self.config.llm_generation_primary_model,
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
                 enable_legal_disclaimer=self.config.enable_legal_disclaimer,
                 risk_notice_level=self.config.risk_notice_level,
+                llm_dispatcher=self.llm_dispatcher,
             )
             
             # 4. 传统混合检索模块
@@ -113,14 +168,16 @@ class AdvancedGraphRAGSystem:
                 config=self.config,
                 milvus_module=self.index_module,
                 data_module=self.data_module,
-                llm_client=self.generation_module.client
+                llm_client=self.generation_module.client,
+                llm_dispatcher=self.llm_dispatcher,
             )
             
             # 5. 图RAG检索模块
             print("初始化图RAG检索引擎...")
             self.graph_rag_retrieval = GraphRAGRetrieval(
                 config=self.config,
-                llm_client=self.generation_module.client
+                llm_client=self.generation_module.client,
+                llm_dispatcher=self.llm_dispatcher,
             )
             
             # 6. 智能查询路由器
@@ -129,7 +186,8 @@ class AdvancedGraphRAGSystem:
                 traditional_retrieval=self.traditional_retrieval,
                 graph_rag_retrieval=self.graph_rag_retrieval,
                 llm_client=self.generation_module.client,
-                config=self.config
+                config=self.config,
+                llm_dispatcher=self.llm_dispatcher,
             )
             
             print("✅ 高级图RAG系统初始化完成！")

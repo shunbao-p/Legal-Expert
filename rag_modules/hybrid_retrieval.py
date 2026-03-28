@@ -9,7 +9,7 @@
 import json
 import logging
 import re
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 from dataclasses import dataclass
 
 from langchain_core.documents import Document
@@ -35,15 +35,33 @@ class RetrievalResult:
 class HybridRetrievalModule:
     """法律场景混合检索模块。"""
 
-    def __init__(self, config, milvus_module, data_module, llm_client):
+    def __init__(self, config, milvus_module, data_module, llm_client, llm_dispatcher: Optional[object] = None):
         self.config = config
         self.milvus_module = milvus_module
         self.data_module = data_module
         self.llm_client = llm_client
+        self.llm_dispatcher = llm_dispatcher
         self.driver = None
         self.bm25_retriever = None
-        self.graph_indexing = GraphIndexingModule(config, llm_client)
+        self.graph_indexing = GraphIndexingModule(config, llm_client, llm_dispatcher=llm_dispatcher)
         self.graph_indexed = False
+
+    def _assist_chat_completion(self, messages: List[Dict[str, str]], max_tokens: int = 500):
+        if self.llm_dispatcher is not None:
+            response, provider, model = self.llm_dispatcher.create_chat_completion(
+                role="assist",
+                messages=messages,
+                temperature=0.1,
+                max_tokens=max_tokens,
+            )
+            logger.info("辅助调用通道(关键词): provider=%s model=%s", provider, model)
+            return response
+        return self.llm_client.chat.completions.create(
+            model=self.config.llm_model,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=max_tokens,
+        )
 
     def initialize(self, chunks: List[Document]):
         """初始化检索系统。"""
@@ -129,10 +147,8 @@ class HybridRetrievalModule:
         }}
         """
         try:
-            response = self.llm_client.chat.completions.create(
-                model=self.config.llm_model,
+            response = self._assist_chat_completion(
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
                 max_tokens=500,
             )
             result = self._safe_json_loads(response.choices[0].message.content.strip())

@@ -9,7 +9,7 @@
 import json
 import logging
 import re
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 from dataclasses import dataclass
 from collections import defaultdict
 
@@ -43,14 +43,32 @@ class RelationKeyValue:
 class GraphIndexingModule:
     """法律图索引模块"""
 
-    def __init__(self, config, llm_client):
+    def __init__(self, config, llm_client, llm_dispatcher: Optional[object] = None):
         self.config = config
         self.llm_client = llm_client
+        self.llm_dispatcher = llm_dispatcher
 
         self.entity_kv_store: Dict[str, EntityKeyValue] = {}
         self.relation_kv_store: Dict[str, RelationKeyValue] = {}
         self.key_to_entities: Dict[str, List[str]] = defaultdict(list)
         self.key_to_relations: Dict[str, List[str]] = defaultdict(list)
+
+    def _assist_chat_completion(self, messages: List[Dict[str, str]], max_tokens: int = 200):
+        if self.llm_dispatcher is not None:
+            response, provider, model = self.llm_dispatcher.create_chat_completion(
+                role="assist",
+                messages=messages,
+                temperature=0.1,
+                max_tokens=max_tokens,
+            )
+            logger.info("辅助调用通道(图索引增强): provider=%s model=%s", provider, model)
+            return response
+        return self.llm_client.chat.completions.create(
+            model=self.config.llm_model,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=max_tokens,
+        )
 
     def create_entity_key_values(
         self,
@@ -262,10 +280,8 @@ class GraphIndexingModule:
         返回 JSON: {{"keywords": ["关键词1", "关键词2"]}}
         """
         try:
-            response = self.llm_client.chat.completions.create(
-                model=self.config.llm_model,
+            response = self._assist_chat_completion(
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
                 max_tokens=200,
             )
             result = json.loads(response.choices[0].message.content.strip())

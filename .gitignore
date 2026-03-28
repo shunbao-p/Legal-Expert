@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 volumes/
 *.log
+data/raw/Laws/

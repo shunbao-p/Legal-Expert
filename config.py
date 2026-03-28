@@ -24,6 +24,17 @@ class GraphRAGConfig:
     # 模型配置
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
     llm_model: str = "kimi-k2-0711-preview"
+    llm_request_timeout_seconds: int = 60
+
+    # 多模型分流配置（固定分流 + 主备切换）
+    llm_generation_primary_provider: str = "kimi"
+    llm_generation_primary_model: str = "kimi-k2-0711-preview"
+    llm_generation_backup_provider: str = "deepseek"
+    llm_generation_backup_model: str = "deepseek-chat"
+    llm_assist_primary_provider: str = "deepseek"
+    llm_assist_primary_model: str = "deepseek-chat"
+    llm_assist_backup_provider: str = "kimi"
+    llm_assist_backup_model: str = "kimi-k2-0711-preview"
 
     # 检索配置（LightRAG Round-robin策略）
     top_k: int = 5
@@ -62,8 +73,11 @@ class GraphRAGConfig:
 
     def __post_init__(self):
         """初始化后的处理"""
-        # LightRAG使用Round-robin策略，无需权重验证
-        pass
+        # 向后兼容：仅在缺失时互相回填，避免静默覆盖用户显式配置。
+        if not self.llm_generation_primary_model and self.llm_model:
+            self.llm_generation_primary_model = self.llm_model
+        if not self.llm_model and self.llm_generation_primary_model:
+            self.llm_model = self.llm_generation_primary_model
     
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> 'GraphRAGConfig':
@@ -83,6 +97,15 @@ class GraphRAGConfig:
             'milvus_dimension': self.milvus_dimension,
             'embedding_model': self.embedding_model,
             'llm_model': self.llm_model,
+            'llm_request_timeout_seconds': self.llm_request_timeout_seconds,
+            'llm_generation_primary_provider': self.llm_generation_primary_provider,
+            'llm_generation_primary_model': self.llm_generation_primary_model,
+            'llm_generation_backup_provider': self.llm_generation_backup_provider,
+            'llm_generation_backup_model': self.llm_generation_backup_model,
+            'llm_assist_primary_provider': self.llm_assist_primary_provider,
+            'llm_assist_primary_model': self.llm_assist_primary_model,
+            'llm_assist_backup_provider': self.llm_assist_backup_provider,
+            'llm_assist_backup_model': self.llm_assist_backup_model,
             'top_k': self.top_k,
 
             'temperature': self.temperature,

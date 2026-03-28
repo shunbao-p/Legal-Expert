@@ -59,12 +59,30 @@ class KnowledgeSubgraph:
 class GraphRAGRetrieval:
     """法律图RAG检索系统。"""
 
-    def __init__(self, config, llm_client):
+    def __init__(self, config, llm_client, llm_dispatcher: Optional[object] = None):
         self.config = config
         self.llm_client = llm_client
+        self.llm_dispatcher = llm_dispatcher
         self.driver = None
         self.entity_cache: Dict[str, Dict[str, Any]] = {}
         self.relation_cache: Dict[str, int] = {}
+
+    def _assist_chat_completion(self, messages: List[Dict[str, str]], max_tokens: int = 800):
+        if self.llm_dispatcher is not None:
+            response, provider, model = self.llm_dispatcher.create_chat_completion(
+                role="assist",
+                messages=messages,
+                temperature=0.1,
+                max_tokens=max_tokens,
+            )
+            logger.info("辅助调用通道(图理解): provider=%s model=%s", provider, model)
+            return response
+        return self.llm_client.chat.completions.create(
+            model=self.config.llm_model,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=max_tokens,
+        )
 
     def initialize(self):
         logger.info("初始化法律图RAG检索系统...")
@@ -138,10 +156,8 @@ class GraphRAGRetrieval:
         }}
         """
         try:
-            response = self.llm_client.chat.completions.create(
-                model=self.config.llm_model,
+            response = self._assist_chat_completion(
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,
                 max_tokens=800,
             )
             data = self._safe_json_loads(response.choices[0].message.content.strip())
@@ -199,10 +215,10 @@ class GraphRAGRetrieval:
         if graph_query.query_type == QueryType.PATH_FINDING:
             return self._find_shortest_paths(graph_query)
 
+        max_depth = max(1, min(int(graph_query.max_depth), 4))
         relation_filter = ""
         params: Dict[str, Any] = {
             "source_entities": graph_query.source_entities,
-            "max_depth": graph_query.max_depth,
         }
         if graph_query.relation_types:
             relation_filter = "AND ALL(rel IN relationships(path) WHERE type(rel) IN $relation_types)"
@@ -221,7 +237,7 @@ class GraphRAGRetrieval:
         UNWIND $source_entities AS source_name
         MATCH (source)
         WHERE COALESCE(source.name, source.title, source.articleId, '') CONTAINS source_name
-        MATCH path = (source)-[*1..$max_depth]-(target)
+        MATCH path = (source)-[*1..{max_depth}]-(target)
         WHERE source <> target
           {relation_filter}
           {target_filter}
