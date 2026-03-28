@@ -37,12 +37,14 @@ class GraphRAGConfig:
     llm_assist_backup_model: str = "kimi-k2-0711-preview"
 
     # 检索配置（LightRAG Round-robin策略）
-    top_k: int = 5
+    top_k: int = 6
     intent_enabled: bool = True
     rerank_enabled: bool = True
     evidence_gate_enabled: bool = True
-    evidence_soft_threshold: float = 0.5
-    evidence_hard_threshold: float = 0.5
+    evidence_soft_threshold: float = 0.4
+    evidence_hard_threshold: float = 0.35
+    evidence_high_confidence_threshold: float = 0.65
+    evidence_gate_top_n: int = 3
     graph_entity_max_len: int = 20
 
     # 生成配置
@@ -118,6 +120,8 @@ class GraphRAGConfig:
             'evidence_gate_enabled': self.evidence_gate_enabled,
             'evidence_soft_threshold': self.evidence_soft_threshold,
             'evidence_hard_threshold': self.evidence_hard_threshold,
+            'evidence_high_confidence_threshold': self.evidence_high_confidence_threshold,
+            'evidence_gate_top_n': self.evidence_gate_top_n,
             'graph_entity_max_len': self.graph_entity_max_len,
 
             'temperature': self.temperature,

@@ -712,6 +712,48 @@ class HybridRetrievalModule:
             logger.error("向量增强检索失败: %s", e)
             return []
 
+    def bm25_search_enhanced(
+        self,
+        query: str,
+        top_k: int = 5,
+        intent: Optional[QueryIntent] = None,
+    ) -> List[Document]:
+        query = sanitize_query_text(query)
+        if not query or self.bm25_retriever is None:
+            return []
+
+        try:
+            raw_docs = self.bm25_retriever.invoke(query)
+        except Exception as e:
+            logger.error("BM25检索失败: %s", e)
+            return []
+
+        if not raw_docs:
+            return []
+
+        limit = min(len(raw_docs), max(1, top_k * 2))
+        if limit == 1:
+            normalized_scores = [1.0]
+        else:
+            normalized_scores = [1.0 - (rank / float(limit - 1)) for rank in range(limit)]
+
+        enhanced_docs: List[Document] = []
+        for rank, raw_doc in enumerate(raw_docs[:limit], start=1):
+            metadata = dict(raw_doc.metadata or {})
+            bm25_score = self._clamp_01(normalized_scores[rank - 1])
+            doc = Document(
+                page_content=raw_doc.page_content,
+                metadata={
+                    **metadata,
+                    "search_type": "bm25",
+                    "search_method": "bm25",
+                    "bm25_rank": rank,
+                    "score_bm25": round(bm25_score, 4),
+                },
+            )
+            enhanced_docs.append(self._apply_intent_metadata(doc, intent))
+        return enhanced_docs
+
     def _get_node_neighbors(self, node_id: str, max_neighbors: int = 3) -> List[str]:
         relation_types = getattr(self.config, "graph_relation_types", [])
         relation_filter = ""
@@ -743,6 +785,7 @@ class HybridRetrievalModule:
         intent = self._parse_query_intent(query) if self.intent_enabled else None
         dual_docs = self.dual_level_retrieval(query, top_k, intent=intent)
         vector_docs = self.vector_search_enhanced(query, top_k, intent=intent)
+        bm25_docs = self.bm25_search_enhanced(query, top_k, intent=intent)
         candidates: Dict[str, Dict[str, Any]] = {}
 
         def doc_key(doc: Document) -> str:
@@ -758,6 +801,7 @@ class HybridRetrievalModule:
                     "entity_score": 0.0,
                     "topic_score": 0.0,
                     "vector_score": 0.0,
+                    "bm25_score": 0.0,
                 }
             return candidates[key]
 
@@ -785,12 +829,24 @@ class HybridRetrievalModule:
                 candidate["doc"] = doc
             candidate["doc"] = self._apply_intent_metadata(candidate["doc"], intent)
 
+        for doc in bm25_docs:
+            doc = self._apply_intent_metadata(doc, intent)
+            key = doc_key(doc)
+            candidate = ensure_candidate(key, doc)
+            bm25_score = self._clamp_01(doc.metadata.get("score_bm25", 0.0))
+            candidate["bm25_score"] = max(candidate["bm25_score"], bm25_score)
+            candidate["topic_score"] = max(candidate["topic_score"], bm25_score)
+            if not candidate["doc"].metadata.get("display_title") and doc.metadata.get("display_title"):
+                candidate["doc"] = doc
+            candidate["doc"] = self._apply_intent_metadata(candidate["doc"], intent)
+
         ranked_docs: List[Document] = []
         for candidate in candidates.values():
             doc = candidate["doc"]
             entity_score = candidate["entity_score"]
             topic_score = candidate["topic_score"]
             vector_score = candidate["vector_score"]
+            bm25_score = candidate["bm25_score"]
             final_score = (
                 self.entity_weight * entity_score
                 + self.topic_weight * topic_score
@@ -802,6 +858,7 @@ class HybridRetrievalModule:
                     "score_entity": round(entity_score, 4),
                     "score_topic": round(topic_score, 4),
                     "score_vector": round(vector_score, 4),
+                    "score_bm25": round(bm25_score, 4),
                     "final_score": round(self._clamp_01(final_score), 4),
                     "score_contract": "final=0.4*entity+0.2*topic+0.4*vector",
                     "rerank_enabled": bool(self.rerank_enabled),

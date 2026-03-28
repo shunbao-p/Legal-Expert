@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import logging
+import re
 from typing import List, Optional, Any, Dict
 
 # 设置日志
@@ -74,11 +75,13 @@ def build_runtime_config() -> GraphRAGConfig:
         "MAX_GRAPH_DEPTH": "max_graph_depth",
         "LLM_REQUEST_TIMEOUT_SECONDS": "llm_request_timeout_seconds",
         "GRAPH_ENTITY_MAX_LEN": "graph_entity_max_len",
+        "EVIDENCE_GATE_TOP_N": "evidence_gate_top_n",
     }
     float_fields = {
         "TEMPERATURE": "temperature",
         "EVIDENCE_SOFT_THRESHOLD": "evidence_soft_threshold",
         "EVIDENCE_HARD_THRESHOLD": "evidence_hard_threshold",
+        "EVIDENCE_HIGH_CONFIDENCE_THRESHOLD": "evidence_high_confidence_threshold",
     }
     bool_fields = {
         "INTENT_ENABLED": "intent_enabled",
@@ -324,22 +327,68 @@ class AdvancedGraphRAGSystem:
             print(f"   主要法律领域: {', '.join(top_domains)}")
 
     def _evaluate_evidence_mode(self, documents: List, question: str) -> Dict[str, Any]:
-        def _derive_must_signal_from_question(top_document) -> Dict[str, Any]:
-            intent = rule_based_parse_query_intent(question)
-            must_terms = [str(x).strip().lower() for x in (intent.must_terms or []) if str(x).strip()]
-            if not must_terms:
-                return {"has_signal": False, "hit_count": 0, "hit_ratio": 0.0, "must_terms": []}
+        gate_top_n = max(1, int(getattr(self.config, "evidence_gate_top_n", 3)))
 
-            md = top_document.metadata or {}
-            joined_text = " ".join(
+        def _normalize_terms(terms: List[str]) -> List[str]:
+            normalized: List[str] = []
+            seen = set()
+            for term in terms or []:
+                value = str(term).strip().lower()
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                normalized.append(value)
+            return normalized
+
+        def _is_explicit_legal_term(term: str) -> bool:
+            value = str(term or "").strip()
+            if not value:
+                return False
+            if re.fullmatch(r"第[0-9一二三四五六七八九十百千万〇零两]+条", value):
+                return True
+            return value.endswith(("法", "法典", "条例", "规定", "办法", "解释"))
+
+        def _collect_doc_must_terms(candidate_docs: List) -> List[str]:
+            terms: List[str] = []
+            for doc in candidate_docs[:gate_top_n]:
+                md = doc.metadata or {}
+                raw_terms = md.get("must_terms", [])
+                if isinstance(raw_terms, str):
+                    terms.append(raw_terms)
+                elif isinstance(raw_terms, (list, tuple, set)):
+                    terms.extend([str(x) for x in raw_terms if str(x).strip()])
+            return _normalize_terms(terms)
+
+        def _build_doc_match_text(doc) -> str:
+            md = doc.metadata or {}
+            return " ".join(
                 [
-                    str(top_document.page_content or ""),
+                    str(doc.page_content or ""),
                     str(md.get("display_title", "") or ""),
                     str(md.get("law_name", "") or ""),
                     str(md.get("article_title", "") or ""),
                     str(md.get("article_id", "") or ""),
                 ]
             ).lower()
+
+        def _derive_must_signal_from_question(candidate_docs: List) -> Dict[str, Any]:
+            doc_terms = _collect_doc_must_terms(candidate_docs)
+            if doc_terms:
+                must_terms = doc_terms
+            else:
+                intent = rule_based_parse_query_intent(question)
+                must_terms = _normalize_terms(intent.must_terms or [])
+            if not must_terms:
+                return {
+                    "has_signal": False,
+                    "hit_count": 0,
+                    "hit_ratio": 0.0,
+                    "must_terms": [],
+                    "explicit_term_detected": False,
+                }
+
+            gate_docs = candidate_docs[:gate_top_n]
+            joined_text = "\n".join(_build_doc_match_text(doc) for doc in gate_docs)
             hit_count = sum(1 for term in must_terms if term and term in joined_text)
             hit_ratio = (hit_count / float(len(must_terms))) if must_terms else 0.0
             return {
@@ -347,6 +396,7 @@ class AdvancedGraphRAGSystem:
                 "hit_count": int(hit_count),
                 "hit_ratio": float(hit_ratio),
                 "must_terms": must_terms,
+                "explicit_term_detected": any(_is_explicit_legal_term(term) for term in must_terms),
             }
 
         default = {
@@ -370,28 +420,37 @@ class AdvancedGraphRAGSystem:
             )
             or 0.0
         )
-        top_must_hit_count = int(metadata.get("must_terms_hit_count", 0) or 0)
-        has_must_signal = "must_terms_hit_count" in metadata or "must_terms" in metadata
-        top_must_total = len(metadata.get("must_terms", []) or [])
+        derived = _derive_must_signal_from_question(documents)
+        has_must_signal = bool(derived.get("has_signal", False))
+        top_must_hit_count = int(derived.get("hit_count", 0))
+        top_must_total = len(derived.get("must_terms", []) or [])
+        explicit_term_detected = bool(derived.get("explicit_term_detected", False))
+        metadata["must_terms_hit_count"] = top_must_hit_count
+        metadata["must_terms_hit_ratio"] = round(float(derived.get("hit_ratio", 0.0)), 4)
+        metadata["must_terms"] = derived.get("must_terms", [])
+        metadata["evidence_gate_top_n"] = gate_top_n
+        top_doc.metadata = metadata
         soft_threshold = float(getattr(self.config, "evidence_soft_threshold", 0.5))
         hard_threshold = float(getattr(self.config, "evidence_hard_threshold", 0.5))
+        high_conf_threshold = float(getattr(self.config, "evidence_high_confidence_threshold", 0.65))
 
         if not has_must_signal:
-            derived = _derive_must_signal_from_question(top_doc)
-            has_must_signal = bool(derived.get("has_signal", False))
-            top_must_hit_count = int(derived.get("hit_count", 0))
-            metadata["must_terms_hit_count"] = top_must_hit_count
-            metadata["must_terms_hit_ratio"] = round(float(derived.get("hit_ratio", 0.0)), 4)
-            metadata["must_terms"] = derived.get("must_terms", [])
-            top_must_total = len(metadata.get("must_terms", []) or [])
-            top_doc.metadata = metadata
-            if not has_must_signal:
-                return {
-                    "mode": "weak",
-                    "reason": "missing_must_signal_no_terms",
-                    "top_rerank_score": round(top_rerank_score, 4),
-                    "top_must_hit_count": top_must_hit_count,
-                }
+            return {
+                "mode": "weak",
+                "reason": "missing_must_signal_no_terms",
+                "top_rerank_score": round(top_rerank_score, 4),
+                "top_must_hit_count": top_must_hit_count,
+            }
+
+        # 高分豁免：只要存在至少1个 must_term 命中且重排分足够高，直接给 strong。
+        if top_rerank_score >= high_conf_threshold and top_must_hit_count >= 1:
+            return {
+                "mode": "strong",
+                "reason": "high_score_with_min_must_hit",
+                "top_rerank_score": round(top_rerank_score, 4),
+                "top_must_hit_count": top_must_hit_count,
+                "question": question,
+            }
 
         if top_must_hit_count == 0 and top_rerank_score < hard_threshold:
             return {
@@ -400,7 +459,7 @@ class AdvancedGraphRAGSystem:
                 "top_rerank_score": round(top_rerank_score, 4),
                 "top_must_hit_count": top_must_hit_count,
             }
-        required_hits = 1 if top_must_total <= 1 else 2
+        required_hits = 2 if (explicit_term_detected and top_must_total > 1) else 1
         if top_must_hit_count < required_hits:
             reason = "soft_gate_low_must_hit"
             if top_rerank_score < soft_threshold:

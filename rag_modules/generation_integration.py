@@ -101,51 +101,44 @@ class GenerationIntegrationModule:
         mode = (answer_mode or "strong").lower()
         if mode == "weak":
             mode_instruction = (
-                "当前为低置信度回答模式：结论必须写明“当前判断置信度较低，需要人工复核”，"
-                "并在适用边界中明确不确定点。"
+                "当前为低置信度模式：请在结尾明确写出“内容仅供参考，如需更权威回复建议您前往专业机构咨询”，"
+                "并点明关键不确定点。"
             )
         elif mode == "insufficient":
             mode_instruction = (
-                "当前为证据不足模式：结论必须写“当前检索证据不足以作出确定判断”，"
+                "当前为证据不足模式：结论必须写“当前检索证据不足以作出确定判断，请更加详细描述您的问题”，"
                 "并给出补充信息建议，不得输出确定性结论。"
             )
         else:
-            mode_instruction = "当前为正常回答模式：结论需谨慎但可给出结构化判断。"
+            mode_instruction = "当前为正常回答模式：结论需谨慎、可执行，语气自然专业。"
 
         return f"""
-你是法律法规咨询助手（非律师执业意见提供者）。
-请严格基于检索信息回答，不得编造法条。
+你是面向普通用户的法律咨询专家。
+请严格基于检索信息回答，不得编造法条，不要输出开发者口吻。
 
 检索到的相关信息：
 {context}
 
 用户问题：{question}
 
-输出格式必须包含以下小节（按顺序）：
-1. 结论
-2. 依据条款
-3. 关联说明
-4. 适用边界
-5. 风险提示
-6. 免责声明
-
-要求：
-- 若证据不足，必须在“结论”中明确写“当前检索证据不足以作出确定判断”。
-- “依据条款”尽量列出法规名与条文编号；无法确定时明确说明“待核对原文”。
+输出要求（用户导向）：
+- 先用 1 段自然语言直接回答用户问题。
+- 全文尽量使用 2-4 段连续表达，必要时可加少量小标题，但不要强制编号，不要机械分点。
+- 依据说明要自然融入正文，优先引用“法规名+条号”；条号不确定时不进行引用“法规名+条号”。
+- 避免“命中率、召回、rerank、候选集”等技术术语，改为用户能理解的表达。
+- 若证据不足，必须明确写“当前检索证据不足以作出确定判断”，并说明还需要补充什么信息。
 - {risk_instruction}
 - {mode_instruction}
 - 不得给出“必然胜诉/绝对合法/绝对违法”等确定性执业结论。
 - {disclaimer_clause}
 
-请输出结构化中文回答：
+请输出自然、专业、面向用户的中文回答：
 """
 
     def _has_disclaimer(self, text: str) -> bool:
         compact = text.replace(" ", "")
         return (
-            "仅供参考" in compact
-            and "不构成法律意见" in compact
-            and ("复核" in compact or "专业法律人士" in compact)
+             "本回答不构成法律意见" in compact
         )
 
     def _ensure_disclaimer(self, text: str) -> str:
@@ -171,31 +164,20 @@ class GenerationIntegrationModule:
 
     def _build_degraded_answer(self, documents: List[Document], error: Exception) -> str:
         answer = (
-            "结论\n"
-            "当前生成通道暂时不可用，已返回检索证据摘要供人工复核。\n\n"
-            "已检索证据摘要\n"
-            f"{self._build_evidence_summary(documents)}\n\n"
-            "建议\n"
-            "请稍后重试，或由专业法律人士结合原文进一步确认。"
+            "当前回答生成通道暂时不可用，我先把已检索到的关键信息给你，供你快速核对。\n\n"
+            f"已检索证据摘要：\n{self._build_evidence_summary(documents)}\n\n"
+            "建议你稍后重试一次；如果问题紧急，优先让专业法律人士结合法规原文做最终判断。"
         )
         logger.error("触发生成降级输出: %s", error)
         return self._ensure_disclaimer(answer)
 
     def _build_insufficient_answer(self, question: str, documents: List[Document]) -> str:
         answer = (
-            "结论\n"
-            "当前检索证据不足以作出确定判断。\n\n"
-            "依据条款\n"
-            "已检索到部分相关信息，但证据命中不足，需补充更具体的法规名、条文号或事实细节。\n\n"
-            "关联说明\n"
-            f"问题：{question}\n"
-            f"证据摘要：\n{self._build_evidence_summary(documents)}\n\n"
-            "适用边界\n"
-            "当前回答仅用于检索辅助，不构成法律定性意见。\n\n"
-            "风险提示\n"
-            "在证据不充分时直接采纳结论可能导致判断偏差，建议由专业法律人士复核。\n\n"
-            "免责声明\n"
-            f"{self.DISCLAIMER_TEXT}"
+            f"就你问的“{question}”，当前检索证据不足以作出确定判断。\n\n"
+            f"目前可供参考的检索信息如下：\n{self._build_evidence_summary(documents)}\n\n"
+            "要把结论做实，建议补充更具体的事实要点（时间、行为、主体身份、是否有书面材料等），"
+            "或直接给出你关心的法规名/条号，我可以据此继续精确检索并给出更稳妥的分析。\n\n"
+            "在证据不充分时直接依据当前结果决策，可能导致判断偏差，建议让专业法律人士复核。"
         )
         return self._ensure_disclaimer(answer)
 
