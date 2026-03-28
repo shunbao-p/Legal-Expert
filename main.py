@@ -22,7 +22,7 @@ from rag_modules import (
 )
 from rag_modules.hybrid_retrieval import HybridRetrievalModule
 from rag_modules.graph_rag_retrieval import GraphRAGRetrieval
-from rag_modules.intelligent_query_router import IntelligentQueryRouter, QueryAnalysis
+from rag_modules.intelligent_query_router import IntelligentQueryRouter, QueryAnalysis, SearchStrategy
 from rag_modules.query_intent_template import rule_based_parse_query_intent
 from rag_modules.text_safety import sanitize_query_text, has_surrogates
 
@@ -43,6 +43,13 @@ def _env_or_default(name: str, default: Any, caster):
 
 def _to_bool(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except Exception:
+        return 0.0
 
 
 def build_runtime_config() -> GraphRAGConfig:
@@ -326,6 +333,75 @@ class AdvancedGraphRAGSystem:
             top_domains = list(domains.keys())[:10]
             print(f"   主要法律领域: {', '.join(top_domains)}")
 
+    @staticmethod
+    def _document_snippet(text: str, limit: int = 180) -> str:
+        compact = " ".join(str(text or "").split())
+        if len(compact) <= limit:
+            return compact
+        return f"{compact[:limit]}..."
+
+    @staticmethod
+    def _analysis_to_dict(analysis: QueryAnalysis) -> Dict[str, Any]:
+        return {
+            "strategy": analysis.recommended_strategy.value,
+            "query_complexity": round(float(analysis.query_complexity), 4),
+            "relationship_intensity": round(float(analysis.relationship_intensity), 4),
+            "confidence": round(float(analysis.confidence), 4),
+            "reasoning_required": bool(analysis.reasoning_required),
+            "reasoning": analysis.reasoning,
+        }
+
+    @staticmethod
+    def _analysis_from_dict(data: Dict[str, Any]) -> QueryAnalysis:
+        strategy_value = str(data.get("strategy", SearchStrategy.HYBRID_TRADITIONAL.value) or "")
+        try:
+            strategy = SearchStrategy(strategy_value)
+        except Exception:
+            strategy = SearchStrategy.HYBRID_TRADITIONAL
+        return QueryAnalysis(
+            query_complexity=_safe_float(data.get("query_complexity", 0.0)),
+            relationship_intensity=_safe_float(data.get("relationship_intensity", 0.0)),
+            reasoning_required=bool(data.get("reasoning_required", False)),
+            entity_count=int(data.get("entity_count", 0) or 0),
+            recommended_strategy=strategy,
+            confidence=_safe_float(data.get("confidence", 0.0)),
+            reasoning=str(data.get("reasoning", "") or ""),
+        )
+
+    def _documents_to_payload(self, documents: List) -> List[Dict[str, Any]]:
+        payload: List[Dict[str, Any]] = []
+        for doc in documents or []:
+            metadata = doc.metadata or {}
+            payload.append(
+                {
+                    "display_title": (
+                        metadata.get("display_title")
+                        or metadata.get("law_name")
+                        or metadata.get("article_title")
+                        or metadata.get("recipe_name")
+                        or "未知内容"
+                    ),
+                    "law_name": str(metadata.get("law_name", "") or ""),
+                    "article_id": str(metadata.get("article_id", "") or ""),
+                    "article_title": str(metadata.get("article_title", "") or ""),
+                    "snippet": self._document_snippet(doc.page_content),
+                    "score": round(
+                        _safe_float(
+                            metadata.get(
+                                "rerank_score",
+                                metadata.get("final_score", metadata.get("relevance_score", 0.0)),
+                            )
+                        ),
+                        4,
+                    ),
+                    "search_type": str(metadata.get("search_type", "") or ""),
+                    "route_strategy": str(metadata.get("route_strategy", "") or ""),
+                    "search_source": str(metadata.get("search_source", "") or ""),
+                    "route_fallback": str(metadata.get("route_fallback", "") or ""),
+                }
+            )
+        return payload
+
     def _evaluate_evidence_mode(self, documents: List, question: str) -> Dict[str, Any]:
         gate_top_n = max(1, int(getattr(self.config, "evidence_gate_top_n", 3)))
 
@@ -477,6 +553,89 @@ class AdvancedGraphRAGSystem:
             "top_must_hit_count": top_must_hit_count,
             "question": question,
         }
+
+    def ask_question_payload(self, question: str, explain_routing: bool = False) -> Dict[str, Any]:
+        """Structured chat result for API/UI consumers."""
+        if not self.system_ready:
+            raise ValueError("系统未就绪，请先构建知识库")
+
+        safe_question = sanitize_query_text(question)
+        if not safe_question:
+            raise ValueError("输入问题包含无效字符或为空，请重新输入。")
+
+        if isinstance(question, str) and has_surrogates(question):
+            logger.warning("检测到输入包含 surrogate 字符，已自动清洗后继续处理")
+
+        start_time = time.time()
+        relevant_docs: List[Any] = []
+        evidence_state: Dict[str, Any] = {
+            "mode": "insufficient",
+            "reason": "uninitialized",
+            "top_rerank_score": 0.0,
+            "top_must_hit_count": 0,
+        }
+        routing_explanation = ""
+
+        try:
+            analysis = None
+            if explain_routing:
+                try:
+                    analysis = self.query_router.analyze_query(safe_question)
+                    routing_explanation = self.query_router.format_routing_explanation(safe_question, analysis)
+                except Exception:
+                    logger.exception("生成路由解释失败")
+            relevant_docs, analysis = self.query_router.route_query(
+                safe_question,
+                self.config.top_k,
+                analysis=analysis,
+            )
+            if not relevant_docs:
+                elapsed = round(time.time() - start_time, 4)
+                return {
+                    "answer": "抱歉，没有找到相关的法律法规信息。请尝试换一种问法。",
+                    "analysis": self._analysis_to_dict(analysis),
+                    "evidence": {
+                        "mode": "insufficient",
+                        "reason": "empty_documents",
+                        "top_rerank_score": 0.0,
+                        "top_must_hit_count": 0,
+                    },
+                    "documents": [],
+                    "elapsed_seconds": elapsed,
+                    "route_fallback": "",
+                    "routing_explanation": routing_explanation,
+                }
+
+            evidence_state = self._evaluate_evidence_mode(relevant_docs, safe_question)
+            answer = self.generation_module.generate_adaptive_answer(
+                safe_question,
+                relevant_docs,
+                answer_mode=evidence_state.get("mode", "strong"),
+            )
+            elapsed = round(time.time() - start_time, 4)
+            route_fallback = ""
+            for doc in relevant_docs:
+                fallback = str((doc.metadata or {}).get("route_fallback", "") or "")
+                if fallback:
+                    route_fallback = fallback
+                    break
+            return {
+                "answer": answer,
+                "analysis": self._analysis_to_dict(analysis),
+                "evidence": {
+                    "mode": str(evidence_state.get("mode", "strong")),
+                    "reason": str(evidence_state.get("reason", "unknown")),
+                    "top_rerank_score": round(_safe_float(evidence_state.get("top_rerank_score", 0.0)), 4),
+                    "top_must_hit_count": int(evidence_state.get("top_must_hit_count", 0) or 0),
+                },
+                "documents": self._documents_to_payload(relevant_docs),
+                "elapsed_seconds": elapsed,
+                "route_fallback": route_fallback,
+                "routing_explanation": routing_explanation,
+            }
+        except Exception:
+            logger.exception("结构化问答执行失败")
+            raise
     
     def ask_question_with_routing(self, question: str, stream: bool = False, explain_routing: bool = False):
         """
@@ -484,6 +643,56 @@ class AdvancedGraphRAGSystem:
         """
         if not self.system_ready:
             raise ValueError("系统未就绪，请先构建知识库")
+
+        if not stream:
+            payload = self.ask_question_payload(question, explain_routing=explain_routing)
+            analysis_data = payload.get("analysis", {})
+            evidence_state = payload.get("evidence", {})
+            documents = payload.get("documents", [])
+            answer = payload.get("answer", "")
+            analysis = self._analysis_from_dict(analysis_data)
+
+            print(f"\n❓ 用户问题: {sanitize_query_text(question)}")
+            strategy = analysis_data.get("strategy", "unknown")
+            strategy_icons = {
+                "hybrid_traditional": "🔍",
+                "graph_rag": "🕸️",
+                "combined": "🔄",
+            }
+            print(f"{strategy_icons.get(strategy, '❓')} 使用策略: {strategy}")
+            print(
+                "📊 复杂度: %.2f, 关系密集度: %.2f"
+                % (
+                    _safe_float(analysis_data.get("query_complexity", 0.0)),
+                    _safe_float(analysis_data.get("relationship_intensity", 0.0)),
+                )
+            )
+            if documents:
+                doc_info = []
+                for doc in documents:
+                    display_title = doc.get("display_title", "未知内容")
+                    article_id = doc.get("article_id", "")
+                    search_type = doc.get("search_type", "unknown")
+                    score = _safe_float(doc.get("score", 0.0))
+                    id_suffix = f"#{article_id}" if article_id else ""
+                    doc_info.append(f"{display_title}{id_suffix}({search_type}, {score:.3f})")
+                print(f"📋 找到 {len(documents)} 个相关文档: {', '.join(doc_info[:3])}")
+                if len(documents) > 3:
+                    print(f"    等 {len(documents)} 个结果...")
+            else:
+                return answer, analysis
+            print(
+                "🧪 证据评估: mode=%s, reason=%s, rerank=%.3f, must_hit=%s"
+                % (
+                    evidence_state.get("mode", "strong"),
+                    evidence_state.get("reason", "unknown"),
+                    _safe_float(evidence_state.get("top_rerank_score", 0.0)),
+                    evidence_state.get("top_must_hit_count", 0),
+                )
+            )
+            print("🎯 智能生成回答...")
+            print("\n⏱️ 问答完成，耗时: %.2f秒" % _safe_float(payload.get("elapsed_seconds", 0.0)))
+            return answer, analysis
 
         safe_question = sanitize_query_text(question)
         if not safe_question:
@@ -495,8 +704,10 @@ class AdvancedGraphRAGSystem:
         print(f"\n❓ 用户问题: {safe_question}")
         
         # 显示路由决策解释（可选）
+        analysis = None
         if explain_routing:
-            explanation = self.query_router.explain_routing_decision(safe_question)
+            analysis = self.query_router.analyze_query(safe_question)
+            explanation = self.query_router.format_routing_explanation(safe_question, analysis)
             print(explanation)
         
         start_time = time.time()
@@ -504,7 +715,11 @@ class AdvancedGraphRAGSystem:
         try:
             # 1. 智能路由检索
             print("执行智能查询路由...")
-            relevant_docs, analysis = self.query_router.route_query(safe_question, self.config.top_k)
+            relevant_docs, analysis = self.query_router.route_query(
+                safe_question,
+                self.config.top_k,
+                analysis=analysis,
+            )
             
             # 2. 显示路由信息
             strategy_icons = {

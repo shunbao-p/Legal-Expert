@@ -5,3 +5,6 @@ __pycache__/
 volumes/
 *.log
 data/raw/Laws/
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo

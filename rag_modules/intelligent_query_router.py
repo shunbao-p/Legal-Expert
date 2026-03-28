@@ -170,13 +170,34 @@ class IntelligentQueryRouter:
             reasoning="规则降级分析",
         )
 
-    def route_query(self, query: str, top_k: int = 5) -> Tuple[List[Document], QueryAnalysis]:
+    def format_routing_explanation(self, query: str, analysis: QueryAnalysis) -> str:
+        query = sanitize_query_text(query)
+        return f"""
+查询路由分析报告
+
+查询：{query}
+复杂度：{analysis.query_complexity:.2f}
+关系密集度：{analysis.relationship_intensity:.2f}
+推理需求：{'是' if analysis.reasoning_required else '否'}
+实体数量：{analysis.entity_count}
+推荐策略：{analysis.recommended_strategy.value}
+置信度：{analysis.confidence:.2f}
+理由：{analysis.reasoning}
+""".strip()
+
+    def route_query(
+        self,
+        query: str,
+        top_k: int = 5,
+        analysis: Optional[QueryAnalysis] = None,
+    ) -> Tuple[List[Document], QueryAnalysis]:
         query = sanitize_query_text(query)
         if not query:
             analysis = self._rule_based_analysis("")
             return [], analysis
 
-        analysis = self.analyze_query(query)
+        if analysis is None:
+            analysis = self.analyze_query(query)
         self._update_route_stats(analysis.recommended_strategy)
 
         try:
@@ -276,15 +297,4 @@ class IntelligentQueryRouter:
     def explain_routing_decision(self, query: str) -> str:
         query = sanitize_query_text(query)
         analysis = self.analyze_query(query)
-        return f"""
-查询路由分析报告
-
-查询：{query}
-复杂度：{analysis.query_complexity:.2f}
-关系密集度：{analysis.relationship_intensity:.2f}
-推理需求：{'是' if analysis.reasoning_required else '否'}
-实体数量：{analysis.entity_count}
-推荐策略：{analysis.recommended_strategy.value}
-置信度：{analysis.confidence:.2f}
-理由：{analysis.reasoning}
-""".strip()
+        return self.format_routing_explanation(query, analysis)
