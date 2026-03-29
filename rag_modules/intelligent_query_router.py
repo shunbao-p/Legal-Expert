@@ -190,6 +190,7 @@ class IntelligentQueryRouter:
         query: str,
         top_k: int = 5,
         analysis: Optional[QueryAnalysis] = None,
+        retrieval_scope: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Document], QueryAnalysis]:
         query = sanitize_query_text(query)
         if not query:
@@ -202,11 +203,11 @@ class IntelligentQueryRouter:
 
         try:
             if analysis.recommended_strategy == SearchStrategy.HYBRID_TRADITIONAL:
-                documents = self.traditional_retrieval.hybrid_search(query, top_k)
+                documents = self.traditional_retrieval.hybrid_search(query, top_k, retrieval_scope=retrieval_scope)
             elif analysis.recommended_strategy == SearchStrategy.GRAPH_RAG:
                 documents = self.graph_rag_retrieval.graph_rag_search(query, top_k)
             else:
-                documents = self._combined_search(query, top_k)
+                documents = self._combined_search(query, top_k, retrieval_scope=retrieval_scope)
 
             # 空结果降级：图检索或组合检索返回空时自动回退传统检索
             if (
@@ -220,7 +221,7 @@ class IntelligentQueryRouter:
                     analysis.recommended_strategy.value,
                     graph_empty_reason,
                 )
-                documents = self.traditional_retrieval.hybrid_search(query, top_k)
+                documents = self.traditional_retrieval.hybrid_search(query, top_k, retrieval_scope=retrieval_scope)
                 for doc in documents:
                     doc.metadata["route_fallback"] = "empty_result_to_traditional"
                     doc.metadata["graph_empty_reason"] = graph_empty_reason
@@ -230,9 +231,14 @@ class IntelligentQueryRouter:
             return self._post_process_results(documents, analysis), analysis
         except Exception as e:
             logger.error("查询路由失败，降级到传统检索: %s", e)
-            return self.traditional_retrieval.hybrid_search(query, top_k), analysis
+            return self.traditional_retrieval.hybrid_search(query, top_k, retrieval_scope=retrieval_scope), analysis
 
-    def _combined_search(self, query: str, top_k: int) -> List[Document]:
+    def _combined_search(
+        self,
+        query: str,
+        top_k: int,
+        retrieval_scope: Optional[Dict[str, Any]] = None,
+    ) -> List[Document]:
         query = sanitize_query_text(query)
         if not query:
             return []
@@ -240,7 +246,11 @@ class IntelligentQueryRouter:
         traditional_k = max(1, top_k // 2)
         graph_k = top_k - traditional_k
 
-        traditional_docs = self.traditional_retrieval.hybrid_search(query, traditional_k)
+        traditional_docs = self.traditional_retrieval.hybrid_search(
+            query,
+            traditional_k,
+            retrieval_scope=retrieval_scope,
+        )
         graph_docs = self.graph_rag_retrieval.graph_rag_search(query, graph_k)
 
         combined: List[Document] = []

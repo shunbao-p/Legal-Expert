@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 
-import { chat, health } from "./api/client";
+import { chat, createChat, deleteChatFile, health, listChatFiles, uploadChatFile } from "./api/client";
 import { AnswerPanel } from "./components/AnswerPanel";
 import { EvidenceList } from "./components/EvidenceList";
 import { QuestionInput } from "./components/QuestionInput";
-import type { DocumentDTO } from "./types";
+import type { DocumentDTO, SessionFileDTO } from "./types";
 
 interface ChatMessage {
   id: number;
@@ -18,28 +18,46 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [statusText, setStatusText] = useState("服务检查中...");
+  const [chatId, setChatId] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [documents, setDocuments] = useState<DocumentDTO[]>([]);
+  const [sessionFiles, setSessionFiles] = useState<SessionFileDTO[]>([]);
 
   useEffect(() => {
     let cancelled = false;
-    health()
-      .then((result) => {
-        if (!cancelled) {
-          if (result.startup_error) {
-            setStatusText("服务暂不可用");
-          } else if (result.system_ready) {
-            setStatusText("待命中");
-          } else {
-            setStatusText("服务准备中");
+    async function initialize() {
+      try {
+        const [healthResult, chatResult] = await Promise.all([health(), createChat()]);
+        if (cancelled) {
+          return;
+        }
+        setChatId(chatResult.chat_id);
+        try {
+          const filesResult = await listChatFiles(chatResult.chat_id);
+          if (!cancelled) {
+            setSessionFiles(filesResult.files || []);
+          }
+        } catch {
+          if (!cancelled) {
+            setSessionFiles([]);
           }
         }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setStatusText("连接异常");
+        if (healthResult.startup_error) {
+          setStatusText("服务暂不可用");
+        } else if (healthResult.system_ready) {
+          setStatusText("待命中");
+        } else {
+          setStatusText("服务准备中");
         }
-      });
+      } catch {
+        if (cancelled) {
+          return;
+        }
+        setStatusText("连接异常");
+        setError("初始化失败，请刷新页面重试。");
+      }
+    }
+    void initialize();
     return () => {
       cancelled = true;
       if (streamTimerRef.current !== null) {
@@ -80,9 +98,64 @@ export default function App() {
     });
   }
 
+  async function refreshFiles(currentChatId: string) {
+    const filesResult = await listChatFiles(currentChatId);
+    setSessionFiles(filesResult.files || []);
+  }
+
+  async function uploadFiles(fileList: FileList | null) {
+    if (!chatId || !fileList || fileList.length === 0) {
+      return;
+    }
+    setError("");
+    setStatusText("文件解析中...");
+    try {
+      const files = Array.from(fileList);
+      const uploaded: SessionFileDTO[] = [];
+      for (const file of files) {
+        const result = await uploadChatFile(chatId, file);
+        uploaded.push(result.file);
+      }
+      await refreshFiles(chatId);
+      const failed = uploaded.filter((item) => item.status !== "ready");
+      if (failed.length > 0) {
+        setStatusText("部分文件解析失败");
+        setError(
+          failed
+            .map((item) => `${item.file_name}: ${item.error || "解析失败"}`)
+            .join("；"),
+        );
+      } else {
+        setStatusText("文件已就绪");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "文件上传失败");
+      setStatusText("上传失败");
+    }
+  }
+
+  async function removeFile(fileId: string) {
+    if (!chatId) {
+      return;
+    }
+    setError("");
+    try {
+      await deleteChatFile(chatId, fileId);
+      await refreshFiles(chatId);
+      setStatusText("文件已移除");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "删除文件失败");
+      setStatusText("删除失败");
+    }
+  }
+
   async function submitQuestion(question: string) {
     const cleanQuestion = question.trim();
     if (!cleanQuestion || loading) {
+      return;
+    }
+    if (!chatId) {
+      setError("会话未初始化完成，请稍后重试。");
       return;
     }
 
@@ -92,7 +165,15 @@ export default function App() {
     setStatusText("查询中...");
 
     try {
-      const result = await chat({ question: cleanQuestion, explain_routing: false });
+      const readyFileIds = sessionFiles
+        .filter((item) => item.active && item.status === "ready")
+        .map((item) => item.file_id);
+      const result = await chat({
+        chat_id: chatId,
+        question: cleanQuestion,
+        explain_routing: false,
+        active_file_ids: readyFileIds.length > 0 ? readyFileIds : undefined,
+      });
       setDocuments(result.documents);
 
       setStatusText("回答生成中...");
@@ -124,7 +205,14 @@ export default function App() {
         </aside>
         <section className="chat-side">
           <AnswerPanel messages={messages} loading={loading} error={error} />
-          <QuestionInput loading={loading} onSubmit={submitQuestion} />
+          <QuestionInput
+            loading={loading}
+            chatReady={Boolean(chatId)}
+            files={sessionFiles}
+            onSubmit={submitQuestion}
+            onUploadFiles={uploadFiles}
+            onRemoveFile={removeFile}
+          />
         </section>
       </div>
     </main>

@@ -1,8 +1,14 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+
+import type { SessionFileDTO } from "../types";
 
 interface QuestionInputProps {
   loading: boolean;
+  chatReady: boolean;
+  files: SessionFileDTO[];
   onSubmit: (question: string) => Promise<void>;
+  onUploadFiles: (files: FileList | null) => Promise<void>;
+  onRemoveFile: (fileId: string) => Promise<void>;
 }
 
 const EXAMPLE_QUESTIONS = [
@@ -12,9 +18,18 @@ const EXAMPLE_QUESTIONS = [
   "未成年人犯罪的处理办法是什么？",
 ];
 
-export function QuestionInput({ loading, onSubmit }: QuestionInputProps) {
+export function QuestionInput({
+  loading,
+  chatReady,
+  files,
+  onSubmit,
+  onUploadFiles,
+  onRemoveFile,
+}: QuestionInputProps) {
   const [question, setQuestion] = useState("");
   const [isComposing, setIsComposing] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   async function submitCurrentQuestion() {
     const trimmed = question.trim();
@@ -30,6 +45,18 @@ export function QuestionInput({ loading, onSubmit }: QuestionInputProps) {
     await submitCurrentQuestion();
   }
 
+  async function handlePickFiles(event: React.ChangeEvent<HTMLInputElement>) {
+    setUploading(true);
+    try {
+      await onUploadFiles(event.target.files);
+    } finally {
+      setUploading(false);
+      if (event.target) {
+        event.target.value = "";
+      }
+    }
+  }
+
   return (
     <section className="composer">
       <div className="example-list">
@@ -39,6 +66,45 @@ export function QuestionInput({ loading, onSubmit }: QuestionInputProps) {
           </button>
         ))}
       </div>
+      <div className="file-toolbar">
+        <input
+          ref={fileInputRef}
+          type="file"
+          className="file-input-hidden"
+          multiple
+          accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.png,.jpg,.jpeg,.bmp,.webp,.mp3,.wav,.m4a,.flac,.txt,.md"
+          onChange={handlePickFiles}
+          disabled={loading || uploading || !chatReady}
+        />
+        <button
+          type="button"
+          className="file-upload-btn"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={loading || uploading || !chatReady}
+        >
+          {uploading ? "上传中..." : "上传文件"}
+        </button>
+        <span className="file-hint">支持 PDF/Word/Excel/图片/音频</span>
+      </div>
+      {files.length > 0 ? (
+        <div className="file-chip-list">
+          {files.map((file) => (
+            <div key={file.file_id} className="file-chip">
+              <span className="file-chip-name">{file.file_name}</span>
+              <span className="file-chip-status">{file.status}</span>
+              <button
+                type="button"
+                className="file-chip-remove"
+                onClick={() => void onRemoveFile(file.file_id)}
+                disabled={loading || uploading}
+                aria-label={`移除 ${file.file_name}`}
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
       <form className="composer-form" onSubmit={handleSubmit}>
         <textarea
           value={question}

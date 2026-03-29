@@ -192,6 +192,80 @@ textarea {
   gap: 10px;
 }
 
+.file-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.file-input-hidden {
+  display: none;
+}
+
+.file-upload-btn {
+  border: 1px solid rgba(138, 90, 36, 0.4);
+  border-radius: 10px;
+  background: #fff6e9;
+  color: var(--accent-strong);
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.file-upload-btn:disabled,
+.file-chip-remove:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.file-hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.file-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(138, 90, 36, 0.26);
+  border-radius: 999px;
+  padding: 4px 10px;
+  background: #fffdf7;
+  max-width: 100%;
+}
+
+.file-chip-name {
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.file-chip-status {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.file-chip-remove {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
 .composer-form textarea {
   width: 100%;
   min-height: 52px;

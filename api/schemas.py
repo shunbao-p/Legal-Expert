@@ -1,13 +1,49 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
 
 class ChatRequest(BaseModel):
+    chat_id: str = Field(..., min_length=1, description="Chat session id")
     question: str = Field(..., min_length=1, description="User question text")
     explain_routing: bool = Field(False, description="Whether to expose routing explanation metadata")
+    active_file_ids: Optional[List[str]] = Field(
+        default=None,
+        description="Optional active file ids override (None means using current session scope)",
+    )
+
+
+class ChatSessionResponse(BaseModel):
+    chat_id: str
+
+
+class SessionFileDTO(BaseModel):
+    file_id: str
+    file_name: str
+    modality: str
+    status: str
+    size_bytes: int
+    uploaded_at: str
+    active: bool = True
+    parsed_chunks: int = 0
+    error: str = ""
+
+
+class UploadFileResponse(BaseModel):
+    file: SessionFileDTO
+
+
+class SessionFilesResponse(BaseModel):
+    chat_id: str
+    files: List[SessionFileDTO]
+
+
+class DeleteFileResponse(BaseModel):
+    chat_id: str
+    file_id: str
+    deleted: bool
 
 
 class AnalysisDTO(BaseModel):

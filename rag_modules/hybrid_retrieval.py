@@ -677,13 +677,15 @@ class HybridRetrievalModule:
         query: str,
         top_k: int = 5,
         intent: Optional[QueryIntent] = None,
+        retrieval_scope: Optional[Dict[str, Any]] = None,
     ) -> List[Document]:
         query = sanitize_query_text(query)
         if not query:
             return []
 
         try:
-            vector_docs = self.milvus_module.similarity_search(query, k=top_k * 2)
+            vector_filters = self._build_vector_filters(retrieval_scope)
+            vector_docs = self.milvus_module.similarity_search(query, k=top_k * 2, filters=vector_filters)
             enhanced_docs: List[Document] = []
             for result in vector_docs:
                 content = result.get("text", "")
@@ -711,6 +713,21 @@ class HybridRetrievalModule:
         except Exception as e:
             logger.error("向量增强检索失败: %s", e)
             return []
+
+    def _build_vector_filters(self, retrieval_scope: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not retrieval_scope:
+            return None
+
+        chat_id = str(retrieval_scope.get("chat_id", "")).strip()
+        raw_file_ids = retrieval_scope.get("active_file_ids")
+        if not chat_id or not isinstance(raw_file_ids, list):
+            return None
+
+        file_ids = [str(file_id).strip() for file_id in raw_file_ids if str(file_id).strip()]
+        if not file_ids:
+            return None
+
+        return {"chat_id": chat_id, "file_id": file_ids}
 
     def bm25_search_enhanced(
         self,
@@ -776,7 +793,12 @@ class HybridRetrievalModule:
             logger.error("获取邻居节点失败: %s", e)
             return []
 
-    def hybrid_search(self, query: str, top_k: int = 5) -> List[Document]:
+    def hybrid_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        retrieval_scope: Optional[Dict[str, Any]] = None,
+    ) -> List[Document]:
         """统一契约融合：字段统一 + 分数统一 + 加权排序。"""
         query = sanitize_query_text(query)
         if not query:
@@ -784,7 +806,12 @@ class HybridRetrievalModule:
 
         intent = self._parse_query_intent(query) if self.intent_enabled else None
         dual_docs = self.dual_level_retrieval(query, top_k, intent=intent)
-        vector_docs = self.vector_search_enhanced(query, top_k, intent=intent)
+        vector_docs = self.vector_search_enhanced(
+            query,
+            top_k,
+            intent=intent,
+            retrieval_scope=retrieval_scope,
+        )
         bm25_docs = self.bm25_search_enhanced(query, top_k, intent=intent)
         candidates: Dict[str, Dict[str, Any]] = {}
 

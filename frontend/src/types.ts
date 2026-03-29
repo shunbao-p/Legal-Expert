@@ -46,3 +46,34 @@ export interface HealthResponse {
   system_ready: boolean;
   startup_error: string;
 }
+
+export interface ChatSessionResponse {
+  chat_id: string;
+}
+
+export interface SessionFileDTO {
+  file_id: string;
+  file_name: string;
+  modality: string;
+  status: string;
+  size_bytes: number;
+  uploaded_at: string;
+  active: boolean;
+  parsed_chunks: number;
+  error: string;
+}
+
+export interface UploadFileResponse {
+  file: SessionFileDTO;
+}
+
+export interface SessionFilesResponse {
+  chat_id: string;
+  files: SessionFileDTO[];
+}
+
+export interface DeleteFileResponse {
+  chat_id: string;
+  file_id: string;
+  deleted: boolean;
+}

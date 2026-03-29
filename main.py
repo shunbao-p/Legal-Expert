@@ -402,6 +402,22 @@ class AdvancedGraphRAGSystem:
             )
         return payload
 
+    @staticmethod
+    def _merge_documents(prefetched_documents: List[Any], retrieved_documents: List[Any], limit: int = 10) -> List[Any]:
+        merged: List[Any] = []
+        seen = set()
+        for doc in (prefetched_documents or []) + (retrieved_documents or []):
+            metadata = getattr(doc, "metadata", {}) or {}
+            chunk_id = str(metadata.get("chunk_id", "") or "")
+            key = chunk_id or str(hash(str(getattr(doc, "page_content", ""))[:200]))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(doc)
+            if len(merged) >= max(1, limit):
+                break
+        return merged
+
     def _evaluate_evidence_mode(self, documents: List, question: str) -> Dict[str, Any]:
         gate_top_n = max(1, int(getattr(self.config, "evidence_gate_top_n", 3)))
 
@@ -554,7 +570,14 @@ class AdvancedGraphRAGSystem:
             "question": question,
         }
 
-    def ask_question_payload(self, question: str, explain_routing: bool = False) -> Dict[str, Any]:
+    def ask_question_payload(
+        self,
+        question: str,
+        explain_routing: bool = False,
+        chat_id: Optional[str] = None,
+        active_file_ids: Optional[List[str]] = None,
+        prefetched_documents: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
         """Structured chat result for API/UI consumers."""
         if not self.system_ready:
             raise ValueError("系统未就绪，请先构建知识库")
@@ -575,6 +598,12 @@ class AdvancedGraphRAGSystem:
             "top_must_hit_count": 0,
         }
         routing_explanation = ""
+        retrieval_scope: Optional[Dict[str, Any]] = None
+        if chat_id:
+            retrieval_scope = {
+                "chat_id": str(chat_id).strip(),
+                "active_file_ids": [str(file_id).strip() for file_id in (active_file_ids or []) if str(file_id).strip()],
+            }
 
         try:
             analysis = None
@@ -588,7 +617,11 @@ class AdvancedGraphRAGSystem:
                 safe_question,
                 self.config.top_k,
                 analysis=analysis,
+                retrieval_scope=retrieval_scope,
             )
+            if prefetched_documents:
+                merge_limit = max(self.config.top_k * 2, len(prefetched_documents) + self.config.top_k)
+                relevant_docs = self._merge_documents(prefetched_documents, relevant_docs, limit=merge_limit)
             if not relevant_docs:
                 elapsed = round(time.time() - start_time, 4)
                 return {
@@ -719,6 +752,7 @@ class AdvancedGraphRAGSystem:
                 safe_question,
                 self.config.top_k,
                 analysis=analysis,
+                retrieval_scope=None,
             )
             
             # 2. 显示路由信息

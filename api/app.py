@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.schemas import ChatRequest, ChatResponse, HealthResponse
+from api.schemas import (
+    ChatRequest,
+    ChatResponse,
+    ChatSessionResponse,
+    DeleteFileResponse,
+    HealthResponse,
+    SessionFilesResponse,
+    UploadFileResponse,
+)
 from api.service import RAGDemoService
 
 logger = logging.getLogger(__name__)
@@ -41,11 +49,67 @@ def health() -> HealthResponse:
     return HealthResponse(**service.health())
 
 
+@app.post("/chats", response_model=ChatSessionResponse)
+def create_chat() -> ChatSessionResponse:
+    return ChatSessionResponse(chat_id=service.create_chat_session())
+
+
+@app.post("/files/upload", response_model=UploadFileResponse)
+async def upload_file(chat_id: str = Form(...), file: UploadFile = File(...)) -> UploadFileResponse:
+    try:
+        data = await file.read()
+        payload = service.upload_file(
+            chat_id=chat_id,
+            file_name=file.filename or "upload.bin",
+            content_type=file.content_type or "",
+            data=data,
+        )
+        return UploadFileResponse(**payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("File upload failed")
+        raise HTTPException(status_code=500, detail=f"文件上传失败: {exc}") from exc
+
+
+@app.get("/chats/{chat_id}/files", response_model=SessionFilesResponse)
+def list_chat_files(chat_id: str) -> SessionFilesResponse:
+    try:
+        payload = service.list_chat_files(chat_id=chat_id)
+        return SessionFilesResponse(**payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("List chat files failed")
+        raise HTTPException(status_code=500, detail=f"获取会话文件失败: {exc}") from exc
+
+
+@app.delete("/chats/{chat_id}/files/{file_id}", response_model=DeleteFileResponse)
+def delete_chat_file(chat_id: str, file_id: str) -> DeleteFileResponse:
+    try:
+        payload = service.delete_chat_file(chat_id=chat_id, file_id=file_id)
+        return DeleteFileResponse(**payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Delete chat file failed")
+        raise HTTPException(status_code=500, detail=f"删除会话文件失败: {exc}") from exc
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest) -> ChatResponse:
     try:
-        response = service.chat(payload.question, explain_routing=payload.explain_routing)
+        response = service.chat(
+            chat_id=payload.chat_id,
+            question=payload.question,
+            explain_routing=payload.explain_routing,
+            active_file_ids=payload.active_file_ids,
+        )
         return ChatResponse(**response)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

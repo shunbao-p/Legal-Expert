@@ -13,7 +13,7 @@ Milvus索引构建模块
 
 import logging
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 
 from pymilvus import MilvusClient, DataType, CollectionSchema, FieldSchema
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -98,6 +98,26 @@ class MilvusIndexConstructionModule:
         )
         
         logger.info("嵌入模型初始化完成")
+
+    def _get_collection_field_names(self) -> Optional[Set[str]]:
+        try:
+            desc = self.client.describe_collection(self.collection_name)
+        except Exception as exc:
+            logger.warning("获取集合字段失败，过滤兼容模式降级: %s", exc)
+            return None
+
+        fields = []
+        if isinstance(desc, dict):
+            if isinstance(desc.get("fields"), list):
+                fields = desc.get("fields", [])
+            elif isinstance(desc.get("schema"), dict) and isinstance(desc["schema"].get("fields"), list):
+                fields = desc["schema"]["fields"]
+
+        names = set()
+        for field in fields:
+            if isinstance(field, dict) and field.get("name"):
+                names.add(str(field["name"]))
+        return names or None
     
     def _create_collection_schema(self) -> CollectionSchema:
         """
@@ -384,11 +404,16 @@ class MilvusIndexConstructionModule:
             # 生成查询向量
             query_vector = self.embeddings.embed_query(query)
             
+            available_fields = self._get_collection_field_names()
+
             # 构建过滤表达式
             filter_expr = ""
             if filters:
                 filter_conditions = []
                 for key, value in filters.items():
+                    if available_fields is not None and key not in available_fields:
+                        logger.info("跳过不存在的Milvus过滤字段: %s", key)
+                        continue
                     if isinstance(value, str):
                         filter_conditions.append(f'{key} == "{value}"')
                     elif isinstance(value, (int, float)):
@@ -412,15 +437,48 @@ class MilvusIndexConstructionModule:
             }
             
             # 构建搜索参数，避免重复传递
+            base_output_fields = [
+                "text",
+                "node_id",
+                "node_type",
+                "law_name",
+                "article_id",
+                "article_title",
+                "legal_domain",
+                "citation_count",
+                "relation_count",
+                "risk_scenarios",
+                "doc_type",
+                "chunk_id",
+                "parent_id",
+                "chat_id",
+                "file_id",
+            ]
+            if available_fields is None:
+                output_fields = [
+                    "text",
+                    "node_id",
+                    "node_type",
+                    "law_name",
+                    "article_id",
+                    "article_title",
+                    "legal_domain",
+                    "citation_count",
+                    "relation_count",
+                    "risk_scenarios",
+                    "doc_type",
+                    "chunk_id",
+                    "parent_id",
+                ]
+            else:
+                output_fields = [name for name in base_output_fields if name in available_fields]
+
             search_kwargs = {
                 "collection_name": self.collection_name,
                 "data": [query_vector],
                 "anns_field": "vector",
                 "limit": k,
-                "output_fields": ["text", "node_id", "node_type",
-                                "law_name", "article_id", "article_title", "legal_domain",
-                                "citation_count", "relation_count", "risk_scenarios", "doc_type",
-                                "chunk_id", "parent_id"],
+                "output_fields": output_fields,
                 "search_params": search_params
             }
             
@@ -434,23 +492,26 @@ class MilvusIndexConstructionModule:
             formatted_results = []
             if results and len(results) > 0:
                 for hit in results[0]:  # results[0]因为我们只发送了一个查询向量
+                    entity = hit.get("entity", {}) if isinstance(hit, dict) else {}
                     result = {
                         "id": hit["id"],
                         "score": hit["distance"],  # 注意：在COSINE距离中，值越大相似度越高
-                        "text": hit["entity"]["text"],
+                        "text": entity.get("text", ""),
                         "metadata": {
-                            "node_id": hit["entity"]["node_id"],
-                            "law_name": hit["entity"]["law_name"],
-                            "article_id": hit["entity"]["article_id"],
-                            "article_title": hit["entity"]["article_title"],
-                            "node_type": hit["entity"]["node_type"],
-                            "legal_domain": hit["entity"]["legal_domain"],
-                            "citation_count": hit["entity"]["citation_count"],
-                            "relation_count": hit["entity"]["relation_count"],
-                            "risk_scenarios": hit["entity"]["risk_scenarios"],
-                            "doc_type": hit["entity"]["doc_type"],
-                            "chunk_id": hit["entity"]["chunk_id"],
-                            "parent_id": hit["entity"]["parent_id"]
+                            "node_id": entity.get("node_id", ""),
+                            "law_name": entity.get("law_name", ""),
+                            "article_id": entity.get("article_id", ""),
+                            "article_title": entity.get("article_title", ""),
+                            "node_type": entity.get("node_type", ""),
+                            "legal_domain": entity.get("legal_domain", ""),
+                            "citation_count": entity.get("citation_count", 0),
+                            "relation_count": entity.get("relation_count", 0),
+                            "risk_scenarios": entity.get("risk_scenarios", ""),
+                            "doc_type": entity.get("doc_type", ""),
+                            "chunk_id": entity.get("chunk_id", ""),
+                            "parent_id": entity.get("parent_id", ""),
+                            "chat_id": entity.get("chat_id", ""),
+                            "file_id": entity.get("file_id", ""),
                         }
                     }
                     formatted_results.append(result)
