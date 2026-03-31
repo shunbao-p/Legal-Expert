@@ -125,6 +125,35 @@ class GraphRAGRetrieval:
         "刑事诉讼法",
         "民事诉讼法",
     }
+    LAW_ALIAS_MAP = {
+        "中华人民共和国刑法": "刑法",
+        "中华人民共和国民法典": "民法典",
+        "中华人民共和国劳动合同法": "劳动合同法",
+        "中华人民共和国未成年人保护法": "未成年人保护法",
+        "中华人民共和国道路交通安全法": "道路交通安全法",
+        "中华人民共和国消费者权益保护法": "消费者权益保护法",
+        "中华人民共和国个人信息保护法": "个人信息保护法",
+        "中华人民共和国数据安全法": "数据安全法",
+        "中华人民共和国网络安全法": "网络安全法",
+        "中华人民共和国行政处罚法": "行政处罚法",
+        "中华人民共和国刑事诉讼法": "刑事诉讼法",
+        "中华人民共和国民事诉讼法": "民事诉讼法",
+    }
+    ZH_DIGIT = {
+        "零": 0,
+        "〇": 0,
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    ZH_UNIT = {"十": 10, "百": 100, "千": 1000, "万": 10000}
 
     def __init__(self, config, llm_client, llm_dispatcher: Optional[object] = None):
         self.config = config
@@ -135,6 +164,7 @@ class GraphRAGRetrieval:
         self.relation_cache: Dict[str, int] = {}
         self.last_empty_reason = ""
         self.last_grounding_stats: Dict[str, Any] = {}
+        self.last_graph_trace: Dict[str, Any] = {}
 
     def _assist_chat_completion(self, messages: List[Dict[str, str]], max_tokens: int = 800):
         if self.llm_dispatcher is not None:
@@ -286,9 +316,13 @@ class GraphRAGRetrieval:
             term = term[1:-1].strip()
         return term
 
-    def _get_graph_entity_max_len(self) -> int:
+    def _get_graph_entity_max_len(self, strict_whitelist: bool = True) -> int:
         try:
-            return max(8, int(getattr(self.config, "graph_entity_max_len", 20)))
+            strict_limit = max(8, int(getattr(self.config, "graph_entity_max_len", 20)))
+            if strict_whitelist:
+                return strict_limit
+            relaxed_limit = int(getattr(self.config, "graph_entity_max_len_relaxed", 32))
+            return max(strict_limit, max(8, relaxed_limit))
         except Exception:
             return 20
 
@@ -317,15 +351,25 @@ class GraphRAGRetrieval:
             return True
         return False
 
-    def _is_valid_entity_term(self, term: str) -> bool:
+    def _is_valid_entity_term(self, term: str, strict_whitelist: bool = True) -> bool:
         normalized = self._normalize_entity_term(term)
         if not normalized:
             return False
         if self._is_generic_label_token(normalized):
             return False
-        if len(normalized) > self._get_graph_entity_max_len():
+        if len(normalized) > self._get_graph_entity_max_len(strict_whitelist=strict_whitelist):
             return False
-        if not self._is_whitelisted_entity_term(normalized):
+        if strict_whitelist:
+            if not self._is_whitelisted_entity_term(normalized):
+                return False
+            return True
+
+        if self._is_whitelisted_entity_term(normalized):
+            return True
+        min_len = max(2, int(getattr(self.config, "graph_relaxed_min_term_len", 2)))
+        if len(normalized) < min_len:
+            return False
+        if re.fullmatch(r"[0-9]+", normalized):
             return False
         return True
 
@@ -411,7 +455,31 @@ class GraphRAGRetrieval:
                 hints.append(term)
         return [self._normalize_entity_term(x) for x in hints if x]
 
-    def _lookup_grounded_nodes(self, terms: List[str], per_term_limit: int = 3) -> List[Dict[str, Any]]:
+    def _has_legal_query_signal(self, query: str, terms: Optional[List[str]] = None) -> bool:
+        query = sanitize_query_text(query)
+        if not query:
+            return False
+        if re.search(r"《[^》]{2,40}》", query):
+            return True
+        if re.search(r"第[0-9一二三四五六七八九十百千万〇零两]+条", query):
+            return True
+        if any(term in query for term in self.LAW_CORE_TERMS):
+            return True
+        for term in terms or []:
+            normalized = self._normalize_entity_term(term)
+            if self._is_article_ref(normalized) or self._is_law_like_term(normalized):
+                return True
+        return False
+
+    def _should_use_contains_fallback(self, query: str, terms: List[str]) -> bool:
+        if not bool(getattr(self.config, "graph_grounding_contains_enabled", False)):
+            return False
+        require_signal = bool(getattr(self.config, "graph_grounding_contains_require_legal_signal", True))
+        if not require_signal:
+            return True
+        return self._has_legal_query_signal(query, terms=terms)
+
+    def _lookup_grounded_nodes(self, terms: List[str], query: str = "", per_term_limit: int = 3) -> List[Dict[str, Any]]:
         if not self.driver or not terms:
             return []
 
@@ -441,6 +509,18 @@ class GraphRAGRetrieval:
                COALESCE(node.name, node.title, node.articleId, '') AS name,
                score
         LIMIT 800
+        """
+        contains_query = """
+        UNWIND $terms AS term
+        MATCH (n)
+        WHERE (n:LawDocument OR n:Article OR n:LegalDomain OR n:RiskScenario OR n:ComplianceStep)
+          AND size(term) >= 2
+          AND COALESCE(n.name, n.title, n.articleId, '') CONTAINS term
+        RETURN term,
+               COALESCE(toString(n.nodeId), elementId(n)) AS node_id,
+               COALESCE(n.name, n.title, n.articleId, '') AS name,
+               0.6 AS score
+        LIMIT 600
         """
 
         try:
@@ -477,6 +557,26 @@ class GraphRAGRetrieval:
         except Exception as e:
             logger.warning("实体fulltext匹配失败（可能索引不存在）: %s", e)
 
+        # 在开关开启且命中法律信号时，才执行 CONTAINS 兜底（默认保守关闭）。
+        if (not merged_hits) and self._should_use_contains_fallback(query, terms):
+            try:
+                with self.driver.session(database=self.config.neo4j_database) as session:
+                    for record in session.run(contains_query, {"terms": terms}):
+                        key = f"{record['term']}::{record['node_id']}"
+                        score = float(record["score"])
+                        if score <= 0:
+                            continue
+                        existing = merged_hits.get(key)
+                        if existing is None or score > existing["score"]:
+                            merged_hits[key] = {
+                                "term": record["term"],
+                                "node_id": record["node_id"],
+                                "name": record["name"],
+                                "score": score,
+                            }
+            except Exception as e:
+                logger.warning("实体CONTAINS兜底匹配失败: %s", e)
+
         grouped: Dict[str, List[Dict[str, Any]]] = {}
         for item in merged_hits.values():
             grouped.setdefault(item["term"], []).append(item)
@@ -493,22 +593,27 @@ class GraphRAGRetrieval:
         query: str,
         raw_entities: List[str],
         allow_query_fallback: bool = True,
+        strict_whitelist: bool = True,
     ) -> Dict[str, Any]:
         terms: List[str] = []
         for term in raw_entities or []:
             normalized = self._normalize_entity_term(term)
             if not normalized:
                 continue
-            if not self._is_valid_entity_term(normalized):
+            if not self._is_valid_entity_term(normalized, strict_whitelist=strict_whitelist):
                 continue
             terms.append(normalized)
             alias = self.ENTITY_ALIAS_MAP.get(normalized)
-            if alias and self._is_valid_entity_term(alias):
+            if alias and self._is_valid_entity_term(alias, strict_whitelist=strict_whitelist):
                 terms.append(alias)
 
         if not terms and allow_query_fallback:
             fallback_terms = self._fallback_extract_entity_terms(query)
-            terms = [term for term in fallback_terms if self._is_valid_entity_term(term)]
+            terms = [
+                term
+                for term in fallback_terms
+                if self._is_valid_entity_term(term, strict_whitelist=strict_whitelist)
+            ]
 
         dedup_terms: List[str] = []
         seen_terms = set()
@@ -516,14 +621,14 @@ class GraphRAGRetrieval:
             normalized = self._normalize_entity_term(term)
             if not normalized:
                 continue
-            if not self._is_valid_entity_term(normalized):
+            if not self._is_valid_entity_term(normalized, strict_whitelist=strict_whitelist):
                 continue
             if normalized in seen_terms:
                 continue
             seen_terms.add(normalized)
             dedup_terms.append(normalized)
 
-        hits = self._lookup_grounded_nodes(dedup_terms, per_term_limit=3)
+        hits = self._lookup_grounded_nodes(dedup_terms, query=query, per_term_limit=3)
         source_node_ids: List[str] = []
         source_entities: List[str] = []
         seen_ids = set()
@@ -543,10 +648,29 @@ class GraphRAGRetrieval:
             "hits": hits,
             "source_node_ids": source_node_ids,
             "source_entities": source_entities,
+            "grounding_mode": "strict" if strict_whitelist else "relaxed",
         }
 
     def _apply_entity_grounding(self, graph_query: GraphQuery, query: str) -> GraphQuery:
-        source_ground = self._ground_entities(query, graph_query.source_entities, allow_query_fallback=True)
+        source_ground = self._ground_entities(
+            query,
+            graph_query.source_entities,
+            allow_query_fallback=True,
+            strict_whitelist=True,
+        )
+        source_mode = "strict"
+        relax_enabled = bool(getattr(self.config, "graph_grounding_relax_enabled", True))
+        if relax_enabled and not source_ground["source_node_ids"]:
+            relaxed_source_ground = self._ground_entities(
+                query,
+                graph_query.source_entities,
+                allow_query_fallback=True,
+                strict_whitelist=False,
+            )
+            if relaxed_source_ground["candidate_terms"]:
+                source_ground = relaxed_source_ground
+                source_mode = "relaxed"
+
         target_seed = graph_query.target_entities
         if graph_query.query_type == QueryType.PATH_FINDING and not target_seed:
             target_seed = self._extract_target_hint_terms(query)
@@ -556,14 +680,28 @@ class GraphRAGRetrieval:
                 query,
                 target_seed,
                 allow_query_fallback=(graph_query.query_type == QueryType.PATH_FINDING),
+                strict_whitelist=True,
             )
+            target_mode = "strict"
+            if relax_enabled and not target_ground["source_node_ids"]:
+                relaxed_target_ground = self._ground_entities(
+                    query,
+                    target_seed,
+                    allow_query_fallback=(graph_query.query_type == QueryType.PATH_FINDING),
+                    strict_whitelist=False,
+                )
+                if relaxed_target_ground["candidate_terms"]:
+                    target_ground = relaxed_target_ground
+                    target_mode = "relaxed"
         else:
             target_ground = {
                 "candidate_terms": [],
                 "hits": [],
                 "source_node_ids": [],
                 "source_entities": [],
+                "grounding_mode": "none",
             }
+            target_mode = "none"
 
         graph_query.source_node_ids = source_ground["source_node_ids"]
         graph_query.target_node_ids = target_ground["source_node_ids"]
@@ -573,9 +711,14 @@ class GraphRAGRetrieval:
         graph_query.target_entities = target_ground["source_entities"]
         graph_query.grounding_meta = {
             "source_candidates": source_ground["candidate_terms"],
+            "source_candidate_count": len(source_ground["candidate_terms"]),
             "source_hit_count": len(source_ground["source_node_ids"]),
             "target_candidates": target_ground["candidate_terms"],
+            "target_candidate_count": len(target_ground["candidate_terms"]),
             "target_hit_count": len(target_ground["source_node_ids"]),
+            "source_grounding_mode": source_mode,
+            "target_grounding_mode": target_mode,
+            "relax_enabled": relax_enabled,
         }
         return graph_query
 
@@ -846,6 +989,7 @@ class GraphRAGRetrieval:
         query = sanitize_query_text(query)
         self.last_empty_reason = ""
         self.last_grounding_stats = {}
+        self.last_graph_trace = {}
         if not query:
             self.last_empty_reason = "empty_query"
             return []
@@ -857,16 +1001,46 @@ class GraphRAGRetrieval:
         graph_query = self.understand_graph_query(query)
         graph_query = self._apply_entity_grounding(graph_query, query)
         self.last_grounding_stats = graph_query.grounding_meta
+        self.last_graph_trace = {
+            "query_type": graph_query.query_type.value,
+            "reason": "",
+            "source_candidate_count": int(graph_query.grounding_meta.get("source_candidate_count", 0)),
+            "source_hit_count": int(graph_query.grounding_meta.get("source_hit_count", 0)),
+            "target_candidate_count": int(graph_query.grounding_meta.get("target_candidate_count", 0)),
+            "target_hit_count": int(graph_query.grounding_meta.get("target_hit_count", 0)),
+            "result_count": 0,
+        }
 
         if not graph_query.source_entities and not graph_query.source_node_ids:
             self.last_empty_reason = "no_grounded_nodes"
-            logger.warning("GraphRAG实体落地失败，跳过图检索: %s", graph_query.grounding_meta)
+            self.last_graph_trace["reason"] = self.last_empty_reason
+            src_cand = int(graph_query.grounding_meta.get("source_candidate_count", 0))
+            src_hit = int(graph_query.grounding_meta.get("source_hit_count", 0))
+            tgt_cand = int(graph_query.grounding_meta.get("target_candidate_count", 0))
+            tgt_hit = int(graph_query.grounding_meta.get("target_hit_count", 0))
+            log_func = logger.info if src_cand == 0 else logger.warning
+            log_func(
+                "GraphRAG实体未落地，跳过图检索: reason=%s source_candidates=%s source_hits=%s target_candidates=%s target_hits=%s",
+                self.last_empty_reason,
+                src_cand,
+                src_hit,
+                tgt_cand,
+                tgt_hit,
+            )
             return []
         if graph_query.query_type == QueryType.PATH_FINDING and not (
             graph_query.target_entities or graph_query.target_node_ids
         ):
             self.last_empty_reason = "path_target_not_grounded"
-            logger.warning("PATH_FINDING 目标实体未落地，回退传统检索: %s", graph_query.grounding_meta)
+            self.last_graph_trace["reason"] = self.last_empty_reason
+            tgt_cand = int(graph_query.grounding_meta.get("target_candidate_count", 0))
+            log_func = logger.info if tgt_cand == 0 else logger.warning
+            log_func(
+                "PATH_FINDING目标实体未落地，回退传统检索: reason=%s target_candidates=%s target_hits=%s",
+                self.last_empty_reason,
+                tgt_cand,
+                int(graph_query.grounding_meta.get("target_hit_count", 0)),
+            )
             return []
 
         results: List[Document] = []
@@ -881,15 +1055,25 @@ class GraphRAGRetrieval:
                 results.extend(self._subgraph_to_documents(subgraph, reasoning_chains))
             if not results:
                 self.last_empty_reason = "no_paths_found"
+                self.last_graph_trace["reason"] = self.last_empty_reason
+                logger.info(
+                    "GraphRAG返回空结果: reason=%s query_type=%s source_hits=%s",
+                    self.last_empty_reason,
+                    graph_query.query_type.value,
+                    int(graph_query.grounding_meta.get("source_hit_count", 0)),
+                )
             results = sorted(
                 results,
                 key=lambda x: x.metadata.get("relevance_score", 0.0),
                 reverse=True,
             )
-            return results[:top_k]
+            final_results = results[:top_k]
+            self.last_graph_trace["result_count"] = len(final_results)
+            return final_results
         except Exception as e:
             logger.error("图RAG检索失败: %s", e)
             self.last_empty_reason = "graph_query_exception"
+            self.last_graph_trace["reason"] = self.last_empty_reason
             return []
 
     def _parse_neo4j_path(self, record, path_type: str) -> Optional[GraphPath]:
@@ -924,16 +1108,192 @@ class GraphRAGRetrieval:
             return rel_type
         return "RELATED"
 
+    def _normalize_law_name(self, value: Any) -> str:
+        raw = self._normalize_entity_term(str(value or ""))
+        if not raw:
+            return ""
+        if raw in self.LAW_ALIAS_MAP:
+            return self.LAW_ALIAS_MAP[raw]
+        compact = re.sub(r"\s+", "", raw)
+        for alias, canonical in self.LAW_ALIAS_MAP.items():
+            if re.sub(r"\s+", "", alias) == compact:
+                return canonical
+        if self._is_law_like_term(raw):
+            return raw
+        return ""
+
+    def _zh_to_int(self, value: str) -> int:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("empty zh number")
+        if text.isdigit():
+            return int(text)
+        total = 0
+        section = 0
+        number = 0
+        for ch in text:
+            if ch in self.ZH_DIGIT:
+                number = self.ZH_DIGIT[ch]
+                continue
+            if ch in self.ZH_UNIT:
+                unit = self.ZH_UNIT[ch]
+                if unit == 10000:
+                    section = (section + number) * unit
+                    total += section
+                    section = 0
+                    number = 0
+                else:
+                    if number == 0:
+                        number = 1
+                    section += number * unit
+                    number = 0
+                continue
+            raise ValueError(f"unsupported zh number char: {ch}")
+        return total + section + number
+
+    def _normalize_article_id(self, value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        compact = raw.replace(" ", "")
+        match = re.search(r"第?\s*([0-9零一二三四五六七八九十百千万两〇]+)\s*条", compact)
+        token = ""
+        if match:
+            token = match.group(1)
+        else:
+            digits = re.findall(r"\d+", compact)
+            if digits:
+                return f"第{int(digits[0])}条"
+            return ""
+        try:
+            number = self._zh_to_int(token)
+        except Exception:
+            digits = re.findall(r"\d+", token)
+            if not digits:
+                return ""
+            number = int(digits[0])
+        return f"第{number}条"
+
+    def _extract_standard_fields_from_nodes(self, nodes: List[Dict[str, Any]]) -> Dict[str, str]:
+        node_infos: List[Dict[str, Any]] = []
+        for node in nodes or []:
+            properties = node.get("properties", {}) or {}
+            labels = set(node.get("labels", []) or [])
+            node_name = self._normalize_entity_term(node.get("name", ""))
+
+            law_candidates = [
+                properties.get("law_name", ""),
+                properties.get("lawName", ""),
+                properties.get("name", "") if "LawDocument" in labels else "",
+                node_name if "LawDocument" in labels else "",
+            ]
+            article_candidates = [
+                properties.get("article_id", ""),
+                properties.get("articleId", ""),
+                node_name if self._is_article_ref(node_name) else "",
+            ]
+            law_hint_candidates = [
+                properties.get("belongs_to_law", ""),
+                properties.get("belongLaw", ""),
+                properties.get("law_name", ""),
+                properties.get("lawName", ""),
+            ]
+
+            law_name_norm = ""
+            article_id_norm = ""
+            article_law_hint = ""
+
+            for candidate in law_candidates:
+                normalized = self._normalize_law_name(candidate)
+                if normalized:
+                    law_name_norm = normalized
+                    break
+            for candidate in article_candidates:
+                normalized = self._normalize_article_id(candidate)
+                if normalized:
+                    article_id_norm = normalized
+                    break
+            for candidate in law_hint_candidates:
+                normalized = self._normalize_law_name(candidate)
+                if normalized:
+                    article_law_hint = normalized
+                    break
+
+            node_infos.append(
+                {
+                    "labels": labels,
+                    "law_name": law_name_norm,
+                    "article_id": article_id_norm,
+                    "article_law_hint": article_law_hint,
+                }
+            )
+
+        # 同节点可同时提取法规名与条号时，优先作为高置信标准字段。
+        for info in node_infos:
+            if info["law_name"] and info["article_id"]:
+                return {"law_name_std": info["law_name"], "article_id_std": info["article_id"]}
+
+        # 条文节点自身带法规归属提示时，可安全配对。
+        for info in node_infos:
+            if info["article_id"] and info["article_law_hint"]:
+                return {"law_name_std": info["article_law_hint"], "article_id_std": info["article_id"]}
+
+        # 路径中相邻的 LawDocument + Article 组合，作为次高置信配对。
+        for idx, info in enumerate(node_infos):
+            if not info["article_id"]:
+                continue
+            for neighbor_idx in (idx - 1, idx + 1):
+                if neighbor_idx < 0 or neighbor_idx >= len(node_infos):
+                    continue
+                neighbor = node_infos[neighbor_idx]
+                if ("LawDocument" in neighbor["labels"]) and neighbor["law_name"]:
+                    return {"law_name_std": neighbor["law_name"], "article_id_std": info["article_id"]}
+
+        law_name_fallback = ""
+        article_id_fallback = ""
+        for info in node_infos:
+            if not law_name_fallback and ("LawDocument" in info["labels"]) and info["law_name"]:
+                law_name_fallback = info["law_name"]
+            if not article_id_fallback and ("Article" in info["labels"]) and info["article_id"]:
+                article_id_fallback = info["article_id"]
+        if not law_name_fallback:
+            for info in node_infos:
+                if info["law_name"]:
+                    law_name_fallback = info["law_name"]
+                    break
+        if not article_id_fallback:
+            for info in node_infos:
+                if info["article_id"]:
+                    article_id_fallback = info["article_id"]
+                    break
+
+        # 保守策略：无法证明同一法规上下文时，不把法名与条号强行拼对。
+        if law_name_fallback and article_id_fallback:
+            return {"law_name_std": law_name_fallback, "article_id_std": ""}
+        return {"law_name_std": law_name_fallback, "article_id_std": article_id_fallback}
+
     def _paths_to_documents(self, paths: List[GraphPath]) -> List[Document]:
         docs: List[Document] = []
         for path in paths:
             path_desc = self._build_path_description(path)
             path_relations = [r["type"] for r in path.relationships]
             reasoning_path = " -> ".join([node.get("name", "") for node in path.nodes])
+            normalized_fields = self._extract_standard_fields_from_nodes(path.nodes)
+            law_name_std = normalized_fields.get("law_name_std", "")
+            article_id_std = normalized_fields.get("article_id_std", "")
+            primary_node_id = ""
+            for node in path.nodes:
+                candidate = str(node.get("id", "") or "").strip()
+                if candidate:
+                    primary_node_id = candidate
+                    break
+            if not primary_node_id:
+                primary_node_id = f"graph_path_{abs(hash(reasoning_path))}"
             docs.append(
                 Document(
                     page_content=path_desc,
                     metadata={
+                        "node_id": primary_node_id,
                         "search_type": "graph_path",
                         "relevance_score": path.relevance_score,
                         "path_type": path.path_type,
@@ -941,8 +1301,12 @@ class GraphRAGRetrieval:
                         "path_depth": path.path_length,
                         "path_relations": path_relations,
                         "reasoning_path": reasoning_path,
-                        "law_name": path.nodes[0].get("name", "") if path.nodes else "",
-                        "article_id": path.nodes[0].get("properties", {}).get("articleId", "") if path.nodes else "",
+                        "display_title": path.nodes[0].get("name", "图路径结果") if path.nodes else "图路径结果",
+                        "law_name_std": law_name_std,
+                        "article_id_std": article_id_std,
+                        # 强制回填主字段，保证评测口径直接读取 law_name/article_id 即可。
+                        "law_name": law_name_std,
+                        "article_id": article_id_std,
                     },
                 )
             )
@@ -952,6 +1316,14 @@ class GraphRAGRetrieval:
         self, subgraph: KnowledgeSubgraph, reasoning_chains: List[str]
     ) -> List[Document]:
         center_name = subgraph.central_nodes[0].get("name", "未知中心实体") if subgraph.central_nodes else "未知中心实体"
+        normalized_fields = self._extract_standard_fields_from_nodes(
+            (subgraph.central_nodes or []) + (subgraph.connected_nodes or [])
+        )
+        law_name_std = normalized_fields.get("law_name_std", "")
+        article_id_std = normalized_fields.get("article_id_std", "")
+        center_node_id = str(subgraph.central_nodes[0].get("id", "") or "").strip() if subgraph.central_nodes else ""
+        if not center_node_id:
+            center_node_id = f"knowledge_subgraph_{abs(hash(center_name))}"
         has_evidence = bool(subgraph.central_nodes and subgraph.connected_nodes and subgraph.relationships)
         relevance = 0.8 if has_evidence else 0.15
         content = (
@@ -966,11 +1338,17 @@ class GraphRAGRetrieval:
             Document(
                 page_content=content,
                 metadata={
+                    "node_id": center_node_id,
                     "search_type": "knowledge_subgraph",
                     "relevance_score": relevance,
                     "reasoning_path": center_name,
                     "path_relations": [r.get("type", "") for r in subgraph.relationships[:8]],
-                    "law_name": center_name,
+                    "display_title": center_name,
+                    "law_name_std": law_name_std,
+                    "article_id_std": article_id_std,
+                    # 强制回填主字段，避免仅有 *_std 而评测口径读不到。
+                    "law_name": law_name_std,
+                    "article_id": article_id_std,
                     "evidence_insufficient": not has_evidence,
                 },
             )

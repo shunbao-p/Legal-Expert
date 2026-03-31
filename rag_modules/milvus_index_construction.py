@@ -380,7 +380,13 @@ class MilvusIndexConstructionModule:
             logger.error(f"添加新文档失败: {e}")
             return False
     
-    def similarity_search(self, query: str, k: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def similarity_search(
+        self,
+        query: str,
+        k: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+        _allow_recover: bool = True,
+    ) -> List[Dict[str, Any]]:
         """
         相似度搜索
         
@@ -393,7 +399,10 @@ class MilvusIndexConstructionModule:
             搜索结果列表
         """
         if not self.collection_created:
-            raise ValueError("请先构建或加载向量索引")
+            logger.warning("Milvus集合未标记为已加载，尝试自动加载: %s", self.collection_name)
+            if not self.load_collection():
+                logger.warning("Milvus集合自动加载失败，跳过向量检索并返回空结果")
+                return []
         
         try:
             query = sanitize_query_text(query)
@@ -430,10 +439,12 @@ class MilvusIndexConstructionModule:
                 if filter_conditions:
                     filter_expr = " and ".join(filter_conditions)
             
-            # 执行搜索 - 修复参数传递
+            # 执行搜索 - 保证 ef >= k，避免 Milvus 抛出参数越界错误
+            limit_k = max(1, int(k))
+            search_ef = max(64, limit_k)
             search_params = {
                 "metric_type": "COSINE",
-                "params": {"ef": 64}
+                "params": {"ef": search_ef}
             }
             
             # 构建搜索参数，避免重复传递
@@ -477,7 +488,7 @@ class MilvusIndexConstructionModule:
                 "collection_name": self.collection_name,
                 "data": [query_vector],
                 "anns_field": "vector",
-                "limit": k,
+                "limit": limit_k,
                 "output_fields": output_fields,
                 "search_params": search_params
             }
@@ -520,6 +531,18 @@ class MilvusIndexConstructionModule:
             
         except Exception as e:
             logger.error(f"相似度搜索失败: {e}")
+            if _allow_recover:
+                logger.warning("Milvus检索异常，尝试重载集合后重试一次: %s", self.collection_name)
+                # 运行期异常时强制重置状态并重载，避免后续请求持续空检索。
+                self.collection_created = False
+                if self.load_collection():
+                    return self.similarity_search(
+                        query=query,
+                        k=k,
+                        filters=filters,
+                        _allow_recover=False,
+                    )
+                logger.warning("Milvus重载失败，自动恢复结束并返回空结果: %s", self.collection_name)
             return []
     
     def get_collection_stats(self) -> Dict[str, Any]:

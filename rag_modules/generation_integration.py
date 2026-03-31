@@ -5,7 +5,7 @@
 import logging
 import os
 import re
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from openai import OpenAI
 from langchain_core.documents import Document
@@ -50,6 +50,7 @@ class GenerationIntegrationModule:
         "总之",
         "当前",
     )
+    ARTICLE_PATTERN = re.compile(r"第[0-9一二三四五六七八九十百千万〇零两]+条")
 
     def __init__(
         self,
@@ -278,6 +279,348 @@ class GenerationIntegrationModule:
             "在证据不充分时直接依据当前结果决策，可能导致判断偏差，建议让专业法律人士复核。"
         )
         return self._post_process_answer(self._ensure_disclaimer(answer), answer_mode="insufficient")
+
+    def _extract_article_candidates(self, question: str, documents: List[Document]) -> List[str]:
+        found: List[str] = []
+        seen = set()
+
+        for item in self.ARTICLE_PATTERN.findall(question or ""):
+            if item not in seen:
+                seen.add(item)
+                found.append(item)
+
+        for doc in documents or []:
+            md = doc.metadata or {}
+            for item in md.get("article_candidates", []) or []:
+                value = str(item or "").strip()
+                if value and value not in seen:
+                    seen.add(value)
+                    found.append(value)
+        return found
+
+    def _extract_law_candidates(self, question: str, documents: List[Document]) -> List[str]:
+        found: List[str] = []
+        seen = set()
+
+        quoted = re.findall(r"《([^》]{2,40})》", question or "")
+        for item in quoted:
+            value = str(item or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                found.append(value)
+
+        for item in re.findall(r"[一-龥]{2,30}(?:法|法典|条例|规定|办法|解释)", question or ""):
+            value = str(item or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                found.append(value)
+
+        for doc in documents or []:
+            md = doc.metadata or {}
+            for item in md.get("law_candidates", []) or []:
+                value = str(item or "").strip()
+                if value and value not in seen:
+                    seen.add(value)
+                    found.append(value)
+        return found
+
+    def _extract_must_terms(self, documents: List[Document]) -> List[str]:
+        terms: List[str] = []
+        seen = set()
+        for doc in documents or []:
+            md = doc.metadata or {}
+            for item in md.get("must_terms", []) or []:
+                value = str(item or "").strip().lower()
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                terms.append(value)
+        return terms
+
+    def _is_article_intent(self, question: str, documents: List[Document], article_candidates: List[str]) -> bool:
+        if self.ARTICLE_PATTERN.search(question or ""):
+            return True
+        if article_candidates:
+            return True
+        for doc in documents or []:
+            if (doc.metadata or {}).get("article_candidates"):
+                return True
+        return False
+
+    @staticmethod
+    def _split_sentences_with_spans(text: str) -> List[Tuple[str, int, int]]:
+        raw = str(text or "")
+        if not raw.strip():
+            return []
+
+        spans: List[Tuple[str, int, int]] = []
+        start = 0
+        for idx, char in enumerate(raw):
+            if char in "。！？；\n":
+                chunk = raw[start : idx + 1].strip()
+                if chunk:
+                    spans.append((chunk, start, idx + 1))
+                start = idx + 1
+        tail = raw[start:].strip()
+        if tail:
+            spans.append((tail, start, len(raw)))
+        return spans
+
+    @staticmethod
+    def _tokenize_overlap_terms(text: str) -> Set[str]:
+        tokens = set()
+        source = text or ""
+        for item in re.findall(r"[A-Za-z0-9一-龥]{2,}", source):
+            value = item.strip().lower()
+            if len(value) >= 2:
+                tokens.add(value)
+        # 中文语料常无空格，补充2-gram以提升 claim-evidence 对齐稳定性。
+        for chunk in re.findall(r"[一-龥]{2,}", source):
+            normalized = chunk.strip().lower()
+            if len(normalized) < 2:
+                continue
+            for idx in range(0, len(normalized) - 1):
+                tokens.add(normalized[idx : idx + 2])
+        return tokens
+
+    def _must_terms_hit_ratio(self, text: str, must_terms: List[str]) -> float:
+        terms = [str(item or "").strip().lower() for item in (must_terms or []) if str(item or "").strip()]
+        if not terms:
+            return 0.0
+        compact = (text or "").lower()
+        hits = sum(1 for term in terms if term in compact)
+        return round(hits / float(len(terms)), 4)
+
+    def _build_draft_claims(self, answer: str, max_claims: int = 4) -> List[str]:
+        compact = re.sub(r"\s+", " ", str(answer or "")).strip()
+        if not compact:
+            return []
+        raw_sentences = [s.strip() for s in re.split(r"(?<=[。！？；!?;])\s*", compact) if s.strip()]
+        claims: List[str] = []
+        for sentence in raw_sentences:
+            if len(sentence) < 10:
+                continue
+            if any(skip in sentence for skip in ["不构成法律意见", "仅供参考", "无法确定"]):
+                continue
+            claims.append(sentence)
+            if len(claims) >= max_claims:
+                break
+        if claims:
+            return claims
+        return [compact[:120]]
+
+    def _find_best_evidence(self, claim_text: str, documents: List[Document]) -> Dict[str, Any]:
+        claim_terms = self._tokenize_overlap_terms(claim_text)
+        if not claim_terms:
+            claim_terms = self._tokenize_overlap_terms((claim_text or "")[:50])
+
+        best: Dict[str, Any] = {
+            "doc": None,
+            "score": 0.0,
+            "start_sent_idx": -1,
+            "end_sent_idx": -1,
+            "char_start": -1,
+            "char_end": -1,
+            "text": "",
+        }
+
+        for doc in documents or []:
+            sent_spans = self._split_sentences_with_spans(doc.page_content or "")
+            if not sent_spans:
+                continue
+            for sent_idx, (sentence, char_start, char_end) in enumerate(sent_spans):
+                sent_terms = self._tokenize_overlap_terms(sentence)
+                if not sent_terms:
+                    continue
+                overlap = len(claim_terms.intersection(sent_terms))
+                if overlap <= 0:
+                    continue
+                ratio = overlap / float(max(1, len(claim_terms)))
+                if ratio > best["score"]:
+                    best = {
+                        "doc": doc,
+                        "score": ratio,
+                        "start_sent_idx": sent_idx,
+                        "end_sent_idx": sent_idx,
+                        "char_start": char_start,
+                        "char_end": char_end,
+                        "text": sentence[:220],
+                    }
+        return best
+
+    @staticmethod
+    def _contains_any(text: str, terms: List[str]) -> bool:
+        source = (text or "").lower()
+        for term in terms or []:
+            value = str(term or "").strip().lower()
+            if value and value in source:
+                return True
+        return False
+
+    def _match_article(self, target_articles: List[str], law_name: str, article_id: str, evidence_text: str) -> bool:
+        if not target_articles:
+            return False
+        combined = " ".join([law_name or "", article_id or "", evidence_text or ""])
+        return self._contains_any(combined, target_articles)
+
+    def _match_law(self, target_laws: List[str], law_name: str, evidence_text: str) -> bool:
+        if not target_laws:
+            return bool((law_name or "").strip())
+        combined = " ".join([law_name or "", evidence_text or ""])
+        return self._contains_any(combined, target_laws)
+
+    def verify_and_refine(
+        self,
+        question: str,
+        claims: List[str],
+        documents: List[Document],
+        answer_mode: str = "strong",
+    ) -> List[Dict[str, Any]]:
+        article_candidates = self._extract_article_candidates(question, documents)
+        law_candidates = self._extract_law_candidates(question, documents)
+        must_terms = self._extract_must_terms(documents)
+        is_article_intent = self._is_article_intent(question, documents, article_candidates)
+        refined: List[Dict[str, Any]] = []
+
+        for idx, claim_text in enumerate(claims, start=1):
+            evidence = self._find_best_evidence(claim_text, documents)
+            doc = evidence.get("doc")
+            md = (doc.metadata or {}) if doc is not None else {}
+            law_name = str(md.get("law_name", "") or "")
+            article_id = str(md.get("article_id", "") or "")
+            doc_id = str(md.get("chunk_id", md.get("node_id", "")) or "").strip()
+            evidence_text = str(evidence.get("text", "") or "")
+            if not doc_id and evidence_text:
+                doc_id = f"auto_{abs(hash((law_name, article_id, evidence_text[:80])))}"
+
+            has_doc_id = bool(doc_id)
+            has_evidence = bool(evidence_text)
+            law_match = self._match_law(law_candidates, law_name, evidence_text)
+            article_match = self._match_article(article_candidates, law_name, article_id, evidence_text)
+            if is_article_intent and not law_candidates:
+                law_match = False
+            must_hit_ratio = self._must_terms_hit_ratio(f"{claim_text} {evidence_text}", must_terms)
+            semantic_ok = float(evidence.get("score", 0.0) or 0.0) >= 0.2
+            evidence_short = len(evidence_text) < 20
+
+            verdict = "unsupported"
+            if not has_evidence:
+                verdict = "unsupported"
+            elif is_article_intent:
+                if law_match and article_match and semantic_ok and not evidence_short:
+                    verdict = "supported"
+                elif law_match and not article_match and must_hit_ratio >= 0.5:
+                    verdict = "weak"
+                elif article_match and semantic_ok:
+                    verdict = "weak"
+                elif law_match or article_match or must_hit_ratio >= 0.2:
+                    verdict = "weak"
+                else:
+                    verdict = "unsupported"
+            else:
+                if law_match and must_hit_ratio >= 0.5 and semantic_ok and not evidence_short:
+                    verdict = "supported"
+                elif law_match or must_hit_ratio >= 0.2 or semantic_ok:
+                    verdict = "weak"
+                else:
+                    verdict = "unsupported"
+
+            refined.append(
+                {
+                    "claim_id": f"c{idx}",
+                    "claim_text": claim_text,
+                    "doc_id": doc_id,
+                    "law_name": law_name,
+                    "article_id": article_id,
+                    "evidence_span": {
+                        "start_sent_idx": int(evidence.get("start_sent_idx", -1)),
+                        "end_sent_idx": int(evidence.get("end_sent_idx", -1)),
+                        "char_start": int(evidence.get("char_start", -1)),
+                        "char_end": int(evidence.get("char_end", -1)),
+                        "text": evidence_text,
+                    },
+                    "verdict": verdict,
+                    "meta": {
+                        "article_intent": is_article_intent,
+                        "has_doc_id": has_doc_id,
+                        "law_match": law_match,
+                        "article_match": article_match,
+                        "must_terms_hit_ratio": must_hit_ratio,
+                        "semantic_score": round(float(evidence.get("score", 0.0) or 0.0), 4),
+                        "evidence_short": evidence_short,
+                        "answer_mode": (answer_mode or "strong").lower(),
+                    },
+                }
+            )
+        return refined
+
+    def _compose_refined_answer(
+        self,
+        refined_claims: List[Dict[str, Any]],
+        question: str,
+        documents: List[Document],
+        answer_mode: str = "strong",
+    ) -> str:
+        supported = [item for item in (refined_claims or []) if item.get("verdict") == "supported"]
+        weak = [item for item in (refined_claims or []) if item.get("verdict") == "weak"]
+        mode = (answer_mode or "strong").lower()
+
+        lines: List[str] = []
+        for item in supported:
+            law = str(item.get("law_name", "") or "")
+            article = str(item.get("article_id", "") or "")
+            citation = " ".join(x for x in [law, article] if x).strip()
+            if citation:
+                lines.append(f"{item.get('claim_text', '')}（依据：{citation}）")
+            else:
+                lines.append(str(item.get("claim_text", "") or ""))
+
+        for item in weak:
+            text = str(item.get("claim_text", "") or "")
+            lines.append(f"基于当前证据，倾向认为：{text}")
+
+        if not lines:
+            return self._build_insufficient_answer(question, documents)
+
+        if mode == "weak" and lines:
+            lines.insert(0, "当前证据强度一般，以下结论请谨慎参考。")
+
+        answer = "\n\n".join(lines)
+        return self._post_process_answer(self._ensure_disclaimer(answer), answer_mode=mode)
+
+    def generate_refined_answer(
+        self,
+        question: str,
+        documents: List[Document],
+        answer_mode: str = "strong",
+    ) -> Dict[str, Any]:
+        if (answer_mode or "").lower() == "insufficient":
+            answer = self._build_insufficient_answer(question, documents)
+            return {"answer": answer, "draft_claims": [], "refined_claims": []}
+
+        draft_answer = self.generate_adaptive_answer(
+            question=question,
+            documents=documents,
+            answer_mode=answer_mode,
+        )
+        draft_claims = self._build_draft_claims(draft_answer)
+        refined_claims = self.verify_and_refine(
+            question=question,
+            claims=draft_claims,
+            documents=documents,
+            answer_mode=answer_mode,
+        )
+        final_answer = self._compose_refined_answer(
+            refined_claims=refined_claims,
+            question=question,
+            documents=documents,
+            answer_mode=answer_mode,
+        )
+        return {
+            "answer": final_answer or draft_answer,
+            "draft_claims": draft_claims,
+            "refined_claims": refined_claims,
+        }
 
     def generate_adaptive_answer(
         self,

@@ -8,7 +8,10 @@
 
 import json
 import logging
+import math
 import re
+import time
+import threading
 from typing import List, Dict, Tuple, Any, Optional
 from dataclasses import dataclass
 
@@ -17,7 +20,7 @@ from langchain_community.retrievers import BM25Retriever
 from neo4j import GraphDatabase
 
 from .graph_indexing import GraphIndexingModule
-from .query_intent_template import QueryIntent, intent_to_keywords, parse_query_intent
+from .query_intent_template import QueryIntent, intent_to_keywords, parse_query_intent, rule_based_parse_query_intent
 from .text_safety import sanitize_query_text
 
 logger = logging.getLogger(__name__)
@@ -53,6 +56,20 @@ class HybridRetrievalModule:
         self.min_final_score = 0.2
         self.intent_enabled = bool(getattr(self.config, "intent_enabled", True))
         self.rerank_enabled = bool(getattr(self.config, "rerank_enabled", True))
+        self.true_rerank_enabled = bool(getattr(self.config, "true_rerank_enabled", True))
+        self.reranker_model_name = str(
+            getattr(self.config, "reranker_model_name", "BAAI/bge-reranker-v2-m3")
+        ).strip()
+        self.reranker_device = str(getattr(self.config, "reranker_device", "auto")).strip() or "auto"
+        self.reranker_batch_size = max(1, int(getattr(self.config, "reranker_batch_size", 8)))
+        self.reranker_max_length = max(128, int(getattr(self.config, "reranker_max_length", 512)))
+        self._cross_encoder = None
+        self._cross_encoder_lock = threading.Lock()
+        self._cross_encoder_failed_reason = ""
+        self._cross_encoder_failed_at = 0.0
+        self._cross_encoder_retry_cooldown_seconds = max(
+            0, int(getattr(self.config, "reranker_retry_cooldown_seconds", 60))
+        )
         self.last_query_intent: Optional[QueryIntent] = None
 
     @staticmethod
@@ -435,6 +452,251 @@ class HybridRetrievalModule:
         reranked.sort(key=lambda x: x.metadata.get("rerank_score", 0.0), reverse=True)
         return reranked[:top_k]
 
+    def _resolve_reranker_device(self) -> str:
+        preferred = str(self.reranker_device or "auto").strip().lower()
+        if preferred and preferred != "auto":
+            return preferred
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+        return "cpu"
+
+    def _ensure_cross_encoder(self):
+        if self._cross_encoder is not None:
+            return self._cross_encoder
+        if self._cross_encoder_failed_reason:
+            elapsed = time.time() - float(self._cross_encoder_failed_at or 0.0)
+            if elapsed < float(self._cross_encoder_retry_cooldown_seconds):
+                raise RuntimeError(self._cross_encoder_failed_reason)
+        if not self.true_rerank_enabled:
+            raise RuntimeError("true_rerank_disabled")
+        if not self.reranker_model_name:
+            raise RuntimeError("empty_reranker_model_name")
+
+        with self._cross_encoder_lock:
+            if self._cross_encoder is not None:
+                return self._cross_encoder
+            if self._cross_encoder_failed_reason:
+                elapsed = time.time() - float(self._cross_encoder_failed_at or 0.0)
+                if elapsed < float(self._cross_encoder_retry_cooldown_seconds):
+                    raise RuntimeError(self._cross_encoder_failed_reason)
+                logger.warning(
+                    "Cross-Encoder初始化失败后达到重试窗口，开始重试: reason=%s elapsed=%.1fs cooldown=%ss",
+                    self._cross_encoder_failed_reason,
+                    elapsed,
+                    self._cross_encoder_retry_cooldown_seconds,
+                )
+                self._cross_encoder_failed_reason = ""
+                self._cross_encoder_failed_at = 0.0
+            try:
+                from sentence_transformers import CrossEncoder
+
+                resolved_device = self._resolve_reranker_device()
+                self._cross_encoder = CrossEncoder(
+                    self.reranker_model_name,
+                    device=resolved_device,
+                    max_length=self.reranker_max_length,
+                    trust_remote_code=True,
+                )
+                logger.info(
+                    "Cross-Encoder重排模型加载完成: model=%s device=%s",
+                    self.reranker_model_name,
+                    resolved_device,
+                )
+                return self._cross_encoder
+            except Exception as exc:
+                self._cross_encoder_failed_reason = f"cross_encoder_init_failed:{exc.__class__.__name__}:{exc}"
+                self._cross_encoder_failed_at = time.time()
+                logger.error("Cross-Encoder重排模型初始化失败: %s", self._cross_encoder_failed_reason)
+                raise RuntimeError(self._cross_encoder_failed_reason) from exc
+
+    def prewarm_cross_encoder(self, query: str = "法律咨询预热", passage: str = "预热样本") -> Dict[str, Any]:
+        """
+        显式预热Cross-Encoder，避免首个真实请求承担全部冷启动开销。
+        """
+        if not self.rerank_enabled:
+            return {"ready": False, "reason": "rerank_disabled", "model": self.reranker_model_name}
+        if not self.true_rerank_enabled:
+            return {"ready": False, "reason": "true_rerank_disabled", "model": self.reranker_model_name}
+
+        started_at = time.time()
+        try:
+            model = self._ensure_cross_encoder()
+            model.predict(
+                [[str(query or "法律咨询预热"), str(passage or "预热样本")]],
+                batch_size=1,
+                show_progress_bar=False,
+            )
+            latency_ms = int((time.time() - started_at) * 1000)
+            return {
+                "ready": True,
+                "reason": "",
+                "model": self.reranker_model_name,
+                "latency_ms": latency_ms,
+            }
+        except Exception as exc:
+            latency_ms = int((time.time() - started_at) * 1000)
+            reason = str(exc) or "cross_encoder_prewarm_failed"
+            return {
+                "ready": False,
+                "reason": reason,
+                "model": self.reranker_model_name,
+                "latency_ms": latency_ms,
+            }
+
+    def _build_rerank_passage(self, doc: Document) -> str:
+        md = doc.metadata or {}
+        fields = [
+            str(md.get("law_name", "") or ""),
+            str(md.get("article_id", "") or ""),
+            str(md.get("article_title", "") or ""),
+            str(md.get("display_title", "") or ""),
+            (doc.page_content or "")[:1400],
+        ]
+        return "\n".join(x for x in fields if x).strip()
+
+    @staticmethod
+    def _sigmoid(value: float) -> float:
+        try:
+            v = float(value)
+        except Exception:
+            return 0.0
+        v = max(-60.0, min(60.0, v))
+        return 1.0 / (1.0 + math.exp(-v))
+
+    def _score_for_fusion(self, doc: Document, key: str, fallback: float = 0.0) -> float:
+        md = doc.metadata or {}
+        if key in md:
+            return self._clamp_01(md.get(key, fallback))
+        return self._clamp_01(fallback)
+
+    def _diversity_key(self, doc: Document) -> str:
+        md = doc.metadata or {}
+        law_name = str(md.get("law_name", "") or "").strip()
+        article_id = str(md.get("article_id", "") or "").strip()
+        if law_name and article_id:
+            return f"{law_name}::{article_id}"
+        return ""
+
+    def _select_diverse_top_k(self, docs: List[Document], top_k: int) -> List[Document]:
+        selected: List[Document] = []
+        overflow: List[Document] = []
+        used = set()
+
+        for doc in docs:
+            key = self._diversity_key(doc)
+            if key and key in used:
+                overflow.append(doc)
+                continue
+            if key:
+                used.add(key)
+            selected.append(doc)
+            if len(selected) >= top_k:
+                break
+
+        if len(selected) < top_k:
+            for doc in overflow:
+                selected.append(doc)
+                if len(selected) >= top_k:
+                    break
+        return selected[:top_k]
+
+    def _cross_encoder_rerank(
+        self,
+        query: str,
+        docs: List[Document],
+        top_k: int,
+    ) -> List[Document]:
+        model = self._ensure_cross_encoder()
+        pairs = [[query, self._build_rerank_passage(doc)] for doc in docs]
+        raw_scores = model.predict(
+            pairs,
+            batch_size=self.reranker_batch_size,
+            show_progress_bar=False,
+        )
+
+        reranked: List[Document] = []
+        for idx, doc in enumerate(docs):
+            md = doc.metadata or {}
+            try:
+                raw = float(raw_scores[idx])
+            except Exception:
+                raw = 0.0
+            score_rerank = self._clamp_01(self._sigmoid(raw))
+            score_vector = self._score_for_fusion(doc, "score_vector", fallback=md.get("score", 0.0))
+            score_bm25 = self._score_for_fusion(doc, "score_bm25", fallback=0.0)
+            final_rank_score = self._clamp_01(0.75 * score_rerank + 0.15 * score_vector + 0.10 * score_bm25)
+
+            md.update(
+                {
+                    "score_rerank": round(score_rerank, 4),
+                    "rerank_score_raw": round(raw, 6),
+                    "rerank_score": round(final_rank_score, 4),
+                    "rerank_model": self.reranker_model_name,
+                    "rerank_contract": "0.75*rerank+0.15*vector+0.10*bm25",
+                    "rerank_fallback_reason": "",
+                }
+            )
+            doc.metadata = md
+            reranked.append(doc)
+
+        reranked.sort(key=lambda x: x.metadata.get("rerank_score", 0.0), reverse=True)
+        return self._select_diverse_top_k(reranked, top_k=top_k)
+
+    def rerank_documents(
+        self,
+        query: str,
+        docs: List[Document],
+        top_k: int = 5,
+        intent: Optional[QueryIntent] = None,
+    ) -> List[Document]:
+        query = sanitize_query_text(query)
+        if not query or not docs:
+            return []
+        limit = max(1, int(top_k))
+
+        started_at = time.time()
+        fallback_reason = ""
+        if self.rerank_enabled and self.true_rerank_enabled:
+            try:
+                reranked = self._cross_encoder_rerank(query, docs, top_k=limit)
+                latency_ms = int((time.time() - started_at) * 1000)
+                for doc in reranked:
+                    md = doc.metadata or {}
+                    md["rerank_latency_ms"] = latency_ms
+                    doc.metadata = md
+                return reranked[:limit]
+            except Exception as exc:
+                fallback_reason = f"cross_encoder_failed:{exc.__class__.__name__}"
+                logger.warning("Cross-Encoder重排失败，降级轻量重排: %s", exc)
+        elif not self.rerank_enabled:
+            fallback_reason = "rerank_disabled"
+        else:
+            fallback_reason = "true_rerank_disabled"
+
+        resolved_intent = intent
+        if resolved_intent is None:
+            # 仅在降级轻量重排时才尝试解析意图，避免每次请求额外触发一次LLM调用。
+            if self.intent_enabled:
+                try:
+                    resolved_intent = self._parse_query_intent(query)
+                except Exception as exc:
+                    logger.warning("降级重排意图解析失败，继续无意图重排: %s", exc)
+
+        baseline_docs = self._lightweight_rerank(docs, intent=resolved_intent, top_k=limit)
+        latency_ms = int((time.time() - started_at) * 1000)
+        for doc in baseline_docs:
+            md = doc.metadata or {}
+            md["rerank_model"] = "lightweight_fallback"
+            md["rerank_fallback_reason"] = fallback_reason
+            md["rerank_latency_ms"] = latency_ms
+            doc.metadata = md
+        return baseline_docs[:limit]
+
     def _safe_json_loads(self, text: str) -> Dict[str, Any]:
         try:
             return json.loads(text)
@@ -798,13 +1060,22 @@ class HybridRetrievalModule:
         query: str,
         top_k: int = 5,
         retrieval_scope: Optional[Dict[str, Any]] = None,
+        apply_rerank: bool = True,
+        use_rule_intent: bool = False,
     ) -> List[Document]:
         """统一契约融合：字段统一 + 分数统一 + 加权排序。"""
         query = sanitize_query_text(query)
         if not query:
             return []
 
-        intent = self._parse_query_intent(query) if self.intent_enabled else None
+        if self.intent_enabled:
+            if use_rule_intent:
+                intent = rule_based_parse_query_intent(query)
+            else:
+                intent = self._parse_query_intent(query)
+        else:
+            intent = None
+
         dual_docs = self.dual_level_retrieval(query, top_k, intent=intent)
         vector_docs = self.vector_search_enhanced(
             query,
@@ -897,14 +1168,21 @@ class HybridRetrievalModule:
         filtered_docs = [d for d in ranked_docs if d.metadata.get("final_score", 0.0) >= self.min_final_score]
         selected_docs = filtered_docs if filtered_docs else ranked_docs
 
-        if self.rerank_enabled:
-            return self._lightweight_rerank(selected_docs, intent=intent, top_k=top_k)
+        if apply_rerank:
+            return self.rerank_documents(query, selected_docs, top_k=top_k, intent=intent)
 
-        baseline_docs = self._lightweight_rerank(selected_docs, intent=intent, top_k=top_k)
-        for doc in baseline_docs:
-            doc.metadata["rerank_score"] = round(self._clamp_01(doc.metadata.get("final_score", 0.0)), 4)
-            doc.metadata["rerank_contract"] = "disabled_fallback_to_final_score"
-        return baseline_docs[:top_k]
+        pooled_docs = selected_docs[:top_k]
+        for doc in pooled_docs:
+            md = doc.metadata or {}
+            if "rerank_score" not in md:
+                md["rerank_score"] = round(
+                    self._clamp_01(md.get("final_score", md.get("relevance_score", 0.0))),
+                    4,
+                )
+            md.setdefault("rerank_model", "not_applied")
+            md.setdefault("rerank_fallback_reason", "route_pool_only")
+            doc.metadata = md
+        return pooled_docs
 
     def _dedup_results(self, results: List[RetrievalResult]) -> List[RetrievalResult]:
         deduped: List[RetrievalResult] = []

@@ -1,0 +1,73 @@
+{
+  "generated_at": "2026-03-31T06:54:35.106757+00:00",
+  "eval_batch_id": "eval-v1-10q-rerun",
+  "base_url": "http://127.0.0.1:8000",
+  "dataset_path": "data\\eval\\eval_questions_v1.jsonl",
+  "chat_id": "71ab8fe981d44cb6be5b07a17c2e5d2a",
+  "result_version": 4,
+  "total_requests": 50,
+  "warmup_requests": 3,
+  "warmup_success": 3,
+  "warmup_failures": 0,
+  "warmup_mode": "light",
+  "eval_fast_mode": false,
+  "timeouts": {
+    "request_timeout_seconds": 120.0,
+    "warmup_timeout_seconds": 300.0,
+    "health_timeout_seconds": 15.0
+  },
+  "law_hit": {
+    "numerator": 8,
+    "denominator": 35,
+    "rate": 0.2286
+  },
+  "law_hit_acceptable": {
+    "numerator": 8,
+    "denominator": 35,
+    "rate": 0.2286
+  },
+  "article_hit": {
+    "numerator": 1,
+    "denominator": 20,
+    "rate": 0.05
+  },
+  "article_hit_acceptable": {
+    "numerator": 2,
+    "denominator": 20,
+    "rate": 0.1
+  },
+  "article_complete_hit": {
+    "numerator": 0,
+    "denominator": 3,
+    "rate": 0.0
+  },
+  "keyword_coverage": {
+    "numerator": 29,
+    "denominator": 150,
+    "rate": 0.1933
+  },
+  "latency": {
+    "count": 49,
+    "mean": 72.5105,
+    "p50": 55.8101,
+    "p95": 111.6686
+  },
+  "stability": {
+    "request_failure_rate": 0.02,
+    "empty_evidence_rate": 0.0,
+    "insufficient_mode_rate": 0.0,
+    "request_failure_count": 1,
+    "empty_evidence_count": 0,
+    "insufficient_mode_count": 0
+  },
+  "graph_route_metrics": {
+    "graph_route_count": 30,
+    "graph_grounding_success_count": 29,
+    "graph_empty_no_grounding_count": 1,
+    "graph_fallback_to_traditional_count": 1,
+    "graph_grounding_success_rate": 0.9667,
+    "graph_empty_no_grounding_rate": 0.0333,
+    "graph_fallback_to_traditional_rate": 0.0333
+  },
+  "exit_code_rule": "0=all success, 2=contains request failure, 1=fatal error"
+}

@@ -3,11 +3,14 @@ import sys
 import time
 import logging
 import re
+from contextlib import nullcontext
 from typing import List, Optional, Any, Dict
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 
 # 添加当前目录到Python路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -52,6 +55,34 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+def _langsmith_enabled() -> bool:
+    return str(os.getenv("LANGSMITH_TRACING", "")).strip().lower() in _TRUE_VALUES
+
+
+def _trace_context(
+    name: str,
+    *,
+    inputs: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    tags: Optional[List[str]] = None,
+):
+    if not _langsmith_enabled():
+        return nullcontext(None)
+    try:
+        from langsmith.run_helpers import trace
+
+        return trace(
+            name,
+            run_type="chain",
+            inputs=inputs or {},
+            metadata=metadata or {},
+            tags=tags or [],
+        )
+    except Exception as exc:
+        logger.warning("LangSmith trace 初始化失败，继续执行主流程: %s", exc)
+        return nullcontext(None)
+
+
 def build_runtime_config() -> GraphRAGConfig:
     base: Dict[str, Any] = DEFAULT_CONFIG.to_dict()
     str_fields = {
@@ -71,29 +102,46 @@ def build_runtime_config() -> GraphRAGConfig:
         "LLM_ASSIST_PRIMARY_MODEL": "llm_assist_primary_model",
         "LLM_ASSIST_BACKUP_PROVIDER": "llm_assist_backup_provider",
         "LLM_ASSIST_BACKUP_MODEL": "llm_assist_backup_model",
+        "RERANKER_MODEL_NAME": "reranker_model_name",
+        "RERANKER_DEVICE": "reranker_device",
     }
     int_fields = {
         "MILVUS_PORT": "milvus_port",
         "MILVUS_DIMENSION": "milvus_dimension",
         "TOP_K": "top_k",
+        "RECALL_POOL_K": "recall_pool_k",
+        "ANSWER_TOP_K": "answer_top_k",
         "MAX_TOKENS": "max_tokens",
         "CHUNK_SIZE": "chunk_size",
         "CHUNK_OVERLAP": "chunk_overlap",
         "MAX_GRAPH_DEPTH": "max_graph_depth",
         "LLM_REQUEST_TIMEOUT_SECONDS": "llm_request_timeout_seconds",
         "GRAPH_ENTITY_MAX_LEN": "graph_entity_max_len",
+        "GRAPH_ENTITY_MAX_LEN_RELAXED": "graph_entity_max_len_relaxed",
+        "GRAPH_RELAXED_MIN_TERM_LEN": "graph_relaxed_min_term_len",
+        "GRAPH_LOW_QUALITY_MAX_KEEP": "graph_low_quality_max_keep",
         "EVIDENCE_GATE_TOP_N": "evidence_gate_top_n",
+        "RERANKER_BATCH_SIZE": "reranker_batch_size",
+        "RERANKER_MAX_LENGTH": "reranker_max_length",
+        "RERANKER_RETRY_COOLDOWN_SECONDS": "reranker_retry_cooldown_seconds",
     }
     float_fields = {
         "TEMPERATURE": "temperature",
         "EVIDENCE_SOFT_THRESHOLD": "evidence_soft_threshold",
         "EVIDENCE_HARD_THRESHOLD": "evidence_hard_threshold",
         "EVIDENCE_HIGH_CONFIDENCE_THRESHOLD": "evidence_high_confidence_threshold",
+        "GRAPH_QUALITY_MIN_RELEVANCE": "graph_quality_min_relevance",
+        "GRAPH_LOW_QUALITY_PENALTY": "graph_low_quality_penalty",
     }
     bool_fields = {
         "INTENT_ENABLED": "intent_enabled",
         "RERANK_ENABLED": "rerank_enabled",
+        "TRUE_RERANK_ENABLED": "true_rerank_enabled",
         "EVIDENCE_GATE_ENABLED": "evidence_gate_enabled",
+        "GRAPH_GROUNDING_RELAX_ENABLED": "graph_grounding_relax_enabled",
+        "GRAPH_GROUNDING_CONTAINS_ENABLED": "graph_grounding_contains_enabled",
+        "GRAPH_GROUNDING_CONTAINS_REQUIRE_LEGAL_SIGNAL": "graph_grounding_contains_require_legal_signal",
+        "GRAPH_QUALITY_GATE_ENABLED": "graph_quality_gate_enabled",
     }
 
     for env_name, key in str_fields.items():
@@ -144,6 +192,12 @@ class AdvancedGraphRAGSystem:
         
         # 系统状态
         self.system_ready = False
+
+    def _get_recall_pool_k(self) -> int:
+        return max(1, int(getattr(self.config, "recall_pool_k", getattr(self.config, "top_k", 6))))
+
+    def _get_answer_top_k(self) -> int:
+        return max(1, int(getattr(self.config, "answer_top_k", getattr(self.config, "top_k", 6))))
         
     def initialize_system(self):
         """初始化高级图RAG系统"""
@@ -381,8 +435,8 @@ class AdvancedGraphRAGSystem:
                         or metadata.get("recipe_name")
                         or "未知内容"
                     ),
-                    "law_name": str(metadata.get("law_name", "") or ""),
-                    "article_id": str(metadata.get("article_id", "") or ""),
+                    "law_name": str(metadata.get("law_name", metadata.get("law_name_std", "")) or ""),
+                    "article_id": str(metadata.get("article_id", metadata.get("article_id_std", "")) or ""),
                     "article_title": str(metadata.get("article_title", "") or ""),
                     "snippet": self._document_snippet(doc.page_content),
                     "score": round(
@@ -398,6 +452,9 @@ class AdvancedGraphRAGSystem:
                     "route_strategy": str(metadata.get("route_strategy", "") or ""),
                     "search_source": str(metadata.get("search_source", "") or ""),
                     "route_fallback": str(metadata.get("route_fallback", "") or ""),
+                    "rerank_model": str(metadata.get("rerank_model", "") or ""),
+                    "rerank_latency_ms": int(metadata.get("rerank_latency_ms", 0) or 0),
+                    "rerank_fallback_reason": str(metadata.get("rerank_fallback_reason", "") or ""),
                 }
             )
         return payload
@@ -577,6 +634,7 @@ class AdvancedGraphRAGSystem:
         chat_id: Optional[str] = None,
         active_file_ids: Optional[List[str]] = None,
         prefetched_documents: Optional[List[Any]] = None,
+        eval_fast_mode: bool = False,
     ) -> Dict[str, Any]:
         """Structured chat result for API/UI consumers."""
         if not self.system_ready:
@@ -591,6 +649,8 @@ class AdvancedGraphRAGSystem:
 
         start_time = time.time()
         relevant_docs: List[Any] = []
+        draft_claims: List[str] = []
+        refined_claims: List[Dict[str, Any]] = []
         evidence_state: Dict[str, Any] = {
             "mode": "insufficient",
             "reason": "uninitialized",
@@ -598,6 +658,7 @@ class AdvancedGraphRAGSystem:
             "top_must_hit_count": 0,
         }
         routing_explanation = ""
+        route_metrics: Dict[str, Any] = {}
         retrieval_scope: Optional[Dict[str, Any]] = None
         if chat_id:
             retrieval_scope = {
@@ -607,20 +668,58 @@ class AdvancedGraphRAGSystem:
 
         try:
             analysis = None
-            if explain_routing:
+            recall_pool_k = self._get_recall_pool_k()
+            answer_top_k = self._get_answer_top_k()
+            if eval_fast_mode and not explain_routing:
+                analysis = self.query_router._rule_based_analysis(safe_question)
+                analysis.recommended_strategy = SearchStrategy.HYBRID_TRADITIONAL
+                analysis.reasoning = (
+                    f"{analysis.reasoning}|eval_fast_force_traditional"
+                    if analysis.reasoning
+                    else "eval_fast_force_traditional"
+                )
+            elif explain_routing:
                 try:
                     analysis = self.query_router.analyze_query(safe_question)
                     routing_explanation = self.query_router.format_routing_explanation(safe_question, analysis)
                 except Exception:
                     logger.exception("生成路由解释失败")
-            relevant_docs, analysis = self.query_router.route_query(
-                safe_question,
-                self.config.top_k,
-                analysis=analysis,
-                retrieval_scope=retrieval_scope,
-            )
+            with _trace_context(
+                "main.route_query",
+                inputs={
+                    "question": safe_question,
+                    "recall_pool_k": recall_pool_k,
+                    "answer_top_k": answer_top_k,
+                    "retrieval_scope": retrieval_scope or {},
+                    "eval_fast_mode": bool(eval_fast_mode),
+                },
+                metadata={
+                    "component": "main",
+                    "stage": "route_query",
+                },
+                tags=["phase:retrieval"],
+            ) as route_run:
+                relevant_docs, analysis = self.query_router.route_query(
+                    safe_question,
+                    recall_pool_k,
+                    analysis=analysis,
+                    retrieval_scope=retrieval_scope,
+                    apply_rerank=False,
+                    force_rule_intent=bool(eval_fast_mode),
+                )
+                route_metrics = self.query_router.get_last_route_trace()
+                if route_run is not None:
+                    analysis_dict = self._analysis_to_dict(analysis)
+                    route_run.end(
+                        outputs={
+                            "strategy": analysis_dict.get("strategy", ""),
+                            "query_complexity": analysis_dict.get("query_complexity", 0.0),
+                            "confidence": analysis_dict.get("confidence", 0.0),
+                            "documents_count": len(relevant_docs or []),
+                        }
+                    )
             if prefetched_documents:
-                merge_limit = max(self.config.top_k * 2, len(prefetched_documents) + self.config.top_k)
+                merge_limit = max(recall_pool_k * 2, len(prefetched_documents) + recall_pool_k)
                 relevant_docs = self._merge_documents(prefetched_documents, relevant_docs, limit=merge_limit)
             if not relevant_docs:
                 elapsed = round(time.time() - start_time, 4)
@@ -634,17 +733,86 @@ class AdvancedGraphRAGSystem:
                         "top_must_hit_count": 0,
                     },
                     "documents": [],
+                    "refine": {
+                        "draft_claim_count": 0,
+                        "refined_claim_count": 0,
+                        "supported_count": 0,
+                        "weak_count": 0,
+                        "unsupported_count": 0,
+                        "claims": [],
+                    },
                     "elapsed_seconds": elapsed,
                     "route_fallback": "",
                     "routing_explanation": routing_explanation,
+                    "route_metrics": route_metrics,
                 }
 
+            with _trace_context(
+                "main.rerank_documents",
+                inputs={
+                    "question": safe_question,
+                    "pool_count": len(relevant_docs),
+                    "answer_top_k": answer_top_k,
+                },
+                metadata={
+                    "component": "main",
+                    "stage": "rerank_documents",
+                    "reranker_model": getattr(self.config, "reranker_model_name", ""),
+                },
+                tags=["phase:retrieval", "phase:rerank"],
+            ) as rerank_run:
+                reranked_docs = self.traditional_retrieval.rerank_documents(
+                    safe_question,
+                    relevant_docs,
+                    top_k=answer_top_k,
+                )
+                if reranked_docs:
+                    relevant_docs = reranked_docs
+                else:
+                    relevant_docs = relevant_docs[:answer_top_k]
+                if rerank_run is not None:
+                    top_score = 0.0
+                    if relevant_docs:
+                        top_score = _safe_float((relevant_docs[0].metadata or {}).get("rerank_score", 0.0))
+                    rerank_run.end(
+                        outputs={
+                            "reranked_count": len(relevant_docs),
+                            "top_rerank_score": round(top_score, 4),
+                        }
+                    )
+
             evidence_state = self._evaluate_evidence_mode(relevant_docs, safe_question)
-            answer = self.generation_module.generate_adaptive_answer(
-                safe_question,
-                relevant_docs,
-                answer_mode=evidence_state.get("mode", "strong"),
-            )
+            with _trace_context(
+                "main.generate_answer",
+                inputs={
+                    "question": safe_question,
+                    "answer_mode": evidence_state.get("mode", "strong"),
+                    "documents_count": len(relevant_docs),
+                },
+                metadata={
+                    "component": "main",
+                    "stage": "generate_answer",
+                    "evidence_mode": evidence_state.get("mode", "strong"),
+                },
+                tags=["phase:generation"],
+            ) as gen_run:
+                refined_payload = self.generation_module.generate_refined_answer(
+                    safe_question,
+                    relevant_docs,
+                    answer_mode=evidence_state.get("mode", "strong"),
+                )
+                answer = str(refined_payload.get("answer", "") or "")
+                draft_claims = [str(item) for item in (refined_payload.get("draft_claims", []) or [])]
+                refined_claims = list(refined_payload.get("refined_claims", []) or [])
+                if gen_run is not None:
+                    gen_run.end(
+                        outputs={
+                            "answer_preview": str(answer)[:300],
+                            "answer_mode": evidence_state.get("mode", "strong"),
+                            "draft_claim_count": len(draft_claims),
+                            "refined_claim_count": len(refined_claims),
+                        }
+                    )
             elapsed = round(time.time() - start_time, 4)
             route_fallback = ""
             for doc in relevant_docs:
@@ -662,9 +830,20 @@ class AdvancedGraphRAGSystem:
                     "top_must_hit_count": int(evidence_state.get("top_must_hit_count", 0) or 0),
                 },
                 "documents": self._documents_to_payload(relevant_docs),
+                "refine": {
+                    "draft_claim_count": len(draft_claims),
+                    "refined_claim_count": len(refined_claims),
+                    "supported_count": sum(1 for x in refined_claims if str(x.get("verdict", "")) == "supported"),
+                    "weak_count": sum(1 for x in refined_claims if str(x.get("verdict", "")) == "weak"),
+                    "unsupported_count": sum(
+                        1 for x in refined_claims if str(x.get("verdict", "")) == "unsupported"
+                    ),
+                    "claims": refined_claims,
+                },
                 "elapsed_seconds": elapsed,
                 "route_fallback": route_fallback,
                 "routing_explanation": routing_explanation,
+                "route_metrics": route_metrics,
             }
         except Exception:
             logger.exception("结构化问答执行失败")
@@ -744,15 +923,18 @@ class AdvancedGraphRAGSystem:
             print(explanation)
         
         start_time = time.time()
+        recall_pool_k = self._get_recall_pool_k()
+        answer_top_k = self._get_answer_top_k()
         
         try:
             # 1. 智能路由检索
             print("执行智能查询路由...")
             relevant_docs, analysis = self.query_router.route_query(
                 safe_question,
-                self.config.top_k,
+                recall_pool_k,
                 analysis=analysis,
                 retrieval_scope=None,
+                apply_rerank=False,
             )
             
             # 2. 显示路由信息
@@ -767,6 +949,15 @@ class AdvancedGraphRAGSystem:
             
             # 3. 显示检索结果信息
             if relevant_docs:
+                reranked_docs = self.traditional_retrieval.rerank_documents(
+                    safe_question,
+                    relevant_docs,
+                    top_k=answer_top_k,
+                )
+                if reranked_docs:
+                    relevant_docs = reranked_docs
+                else:
+                    relevant_docs = relevant_docs[:answer_top_k]
                 doc_info = []
                 for doc in relevant_docs:
                     display_title = (

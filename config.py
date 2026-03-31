@@ -38,14 +38,31 @@ class GraphRAGConfig:
 
     # 检索配置（LightRAG Round-robin策略）
     top_k: int = 6
+    recall_pool_k: int = 50
+    answer_top_k: int = 5
     intent_enabled: bool = True
     rerank_enabled: bool = True
+    true_rerank_enabled: bool = True
+    reranker_model_name: str = "BAAI/bge-reranker-v2-m3"
+    reranker_device: str = "auto"
+    reranker_batch_size: int = 8
+    reranker_max_length: int = 512
+    reranker_retry_cooldown_seconds: int = 60
     evidence_gate_enabled: bool = True
     evidence_soft_threshold: float = 0.4
     evidence_hard_threshold: float = 0.35
     evidence_high_confidence_threshold: float = 0.65
     evidence_gate_top_n: int = 3
     graph_entity_max_len: int = 20
+    graph_grounding_relax_enabled: bool = True
+    graph_entity_max_len_relaxed: int = 32
+    graph_relaxed_min_term_len: int = 2
+    graph_grounding_contains_enabled: bool = False
+    graph_grounding_contains_require_legal_signal: bool = True
+    graph_quality_gate_enabled: bool = True
+    graph_quality_min_relevance: float = 0.55
+    graph_low_quality_max_keep: int = 1
+    graph_low_quality_penalty: float = 0.35
 
     # 生成配置
     temperature: float = 0.1
@@ -115,14 +132,31 @@ class GraphRAGConfig:
             'llm_assist_backup_provider': self.llm_assist_backup_provider,
             'llm_assist_backup_model': self.llm_assist_backup_model,
             'top_k': self.top_k,
+            'recall_pool_k': self.recall_pool_k,
+            'answer_top_k': self.answer_top_k,
             'intent_enabled': self.intent_enabled,
             'rerank_enabled': self.rerank_enabled,
+            'true_rerank_enabled': self.true_rerank_enabled,
+            'reranker_model_name': self.reranker_model_name,
+            'reranker_device': self.reranker_device,
+            'reranker_batch_size': self.reranker_batch_size,
+            'reranker_max_length': self.reranker_max_length,
+            'reranker_retry_cooldown_seconds': self.reranker_retry_cooldown_seconds,
             'evidence_gate_enabled': self.evidence_gate_enabled,
             'evidence_soft_threshold': self.evidence_soft_threshold,
             'evidence_hard_threshold': self.evidence_hard_threshold,
             'evidence_high_confidence_threshold': self.evidence_high_confidence_threshold,
             'evidence_gate_top_n': self.evidence_gate_top_n,
             'graph_entity_max_len': self.graph_entity_max_len,
+            'graph_grounding_relax_enabled': self.graph_grounding_relax_enabled,
+            'graph_entity_max_len_relaxed': self.graph_entity_max_len_relaxed,
+            'graph_relaxed_min_term_len': self.graph_relaxed_min_term_len,
+            'graph_grounding_contains_enabled': self.graph_grounding_contains_enabled,
+            'graph_grounding_contains_require_legal_signal': self.graph_grounding_contains_require_legal_signal,
+            'graph_quality_gate_enabled': self.graph_quality_gate_enabled,
+            'graph_quality_min_relevance': self.graph_quality_min_relevance,
+            'graph_low_quality_max_keep': self.graph_low_quality_max_keep,
+            'graph_low_quality_penalty': self.graph_low_quality_penalty,
 
             'temperature': self.temperature,
             'max_tokens': self.max_tokens,

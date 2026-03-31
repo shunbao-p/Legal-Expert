@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import re
 import threading
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
@@ -15,6 +17,8 @@ if TYPE_CHECKING:
     from main import AdvancedGraphRAGSystem
 
 logger = logging.getLogger(__name__)
+
+_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 
 
 @dataclass
@@ -40,6 +44,10 @@ class RAGDemoService:
         self._system: Optional["AdvancedGraphRAGSystem"] = None
         self._initialized = False
         self._startup_error = ""
+        self._reranker_ready = False
+        self._reranker_model = ""
+        self._reranker_prewarm_latency_ms = 0
+        self._reranker_prewarm_reason = ""
         self._chat_sessions: set[str] = set()
         self._chat_files: dict[str, dict[str, SessionFileRecord]] = {}
         self._upload_root = Path("data/session_uploads")
@@ -68,14 +76,55 @@ class RAGDemoService:
                 system = AdvancedGraphRAGSystem()
                 system.initialize_system()
                 system.build_knowledge_base()
+                self._prewarm_reranker(system)
                 self._system = system
                 self._initialized = True
                 self._startup_error = ""
-                logger.info("RAG demo service startup complete")
+                logger.info(
+                    "RAG demo service startup complete: reranker_ready=%s model=%s latency_ms=%s reason=%s",
+                    self._reranker_ready,
+                    self._reranker_model,
+                    self._reranker_prewarm_latency_ms,
+                    self._reranker_prewarm_reason or "",
+                )
             except Exception as exc:
                 self._startup_error = str(exc)
                 logger.exception("RAG demo service startup failed")
                 raise
+
+    def _prewarm_reranker(self, system: "AdvancedGraphRAGSystem") -> None:
+        result: dict[str, Any] = {
+            "ready": False,
+            "reason": "prewarm_not_started",
+            "model": "",
+            "latency_ms": 0,
+        }
+        try:
+            retrieval = getattr(system, "traditional_retrieval", None)
+            if retrieval is None:
+                result["reason"] = "traditional_retrieval_unavailable"
+            else:
+                prewarm = getattr(retrieval, "prewarm_cross_encoder", None)
+                if callable(prewarm):
+                    result = prewarm()
+                else:
+                    result["reason"] = "prewarm_method_missing"
+                result["model"] = str(
+                    result.get("model", "") or getattr(retrieval, "reranker_model_name", "")
+                ).strip()
+        except Exception as exc:
+            result = {
+                "ready": False,
+                "reason": f"prewarm_exception:{exc.__class__.__name__}:{exc}",
+                "model": "",
+                "latency_ms": 0,
+            }
+            logger.warning("Reranker prewarm failed: %s", exc)
+
+        self._reranker_ready = bool(result.get("ready", False))
+        self._reranker_model = str(result.get("model", "") or "").strip()
+        self._reranker_prewarm_latency_ms = int(result.get("latency_ms", 0) or 0)
+        self._reranker_prewarm_reason = str(result.get("reason", "") or "")
 
     def shutdown(self) -> None:
         with self._lock:
@@ -83,6 +132,10 @@ class RAGDemoService:
                 self._system._cleanup()
             self._system = None
             self._initialized = False
+            self._reranker_ready = False
+            self._reranker_model = ""
+            self._reranker_prewarm_latency_ms = 0
+            self._reranker_prewarm_reason = ""
             self._chat_sessions.clear()
             self._chat_files.clear()
 
@@ -98,6 +151,10 @@ class RAGDemoService:
             "initialized": self._initialized,
             "system_ready": self.system_ready,
             "startup_error": self._startup_error,
+            "reranker_ready": self._reranker_ready,
+            "reranker_model": self._reranker_model,
+            "reranker_prewarm_latency_ms": self._reranker_prewarm_latency_ms,
+            "reranker_prewarm_reason": self._reranker_prewarm_reason,
         }
 
     def create_chat_session(self) -> str:
@@ -387,11 +444,17 @@ class RAGDemoService:
         candidates.sort(key=lambda item: item[0], reverse=True)
         return [item[1] for item in candidates[:top_k]]
 
+    @staticmethod
+    def _langsmith_enabled() -> bool:
+        return str(os.getenv("LANGSMITH_TRACING", "")).strip().lower() in _TRUE_VALUES
+
     def chat(
         self,
         chat_id: str,
         question: str,
         explain_routing: bool = False,
+        eval_batch_id: Optional[str] = None,
+        eval_fast_mode: Optional[bool] = None,
         active_file_ids: Optional[list[str]] = None,
     ) -> dict:
         self._assert_chat_session_exists(chat_id)
@@ -399,10 +462,63 @@ class RAGDemoService:
             self.startup()
         assert self._system is not None
         session_docs = self._retrieve_session_documents(chat_id, question, active_file_ids=active_file_ids)
-        return self._system.ask_question_payload(
-            question,
-            explain_routing=explain_routing,
-            chat_id=chat_id,
-            active_file_ids=active_file_ids,
-            prefetched_documents=session_docs,
-        )
+        # fast mode 必须显式开启，避免仅传 eval_batch_id 时隐式改写评测口径。
+        resolved_eval_fast_mode = bool(eval_fast_mode) if eval_fast_mode is not None else False
+
+        trace_context = nullcontext(None)
+        if self._langsmith_enabled():
+            try:
+                from langsmith.run_helpers import trace
+
+                tags = ["endpoint:/chat", "component:api.service"]
+                if eval_batch_id:
+                    tags.append("eval:true")
+                trace_context = trace(
+                    "api.chat",
+                    run_type="chain",
+                    inputs={
+                        "chat_id": chat_id,
+                        "question": question,
+                        "explain_routing": bool(explain_routing),
+                        "active_file_ids": active_file_ids or [],
+                        "eval_batch_id": eval_batch_id or "",
+                        "eval_fast_mode": resolved_eval_fast_mode,
+                    },
+                    tags=tags,
+                    metadata={
+                        "chat_id": chat_id,
+                        "eval_batch_id": eval_batch_id or "",
+                        "eval_fast_mode": resolved_eval_fast_mode,
+                        "prefetched_documents_count": len(session_docs),
+                    },
+                )
+            except Exception as exc:
+                logger.warning("LangSmith trace 初始化失败，继续执行主流程: %s", exc)
+
+        with trace_context as run:
+            try:
+                response = self._system.ask_question_payload(
+                    question,
+                    explain_routing=explain_routing,
+                    chat_id=chat_id,
+                    active_file_ids=active_file_ids,
+                    prefetched_documents=session_docs,
+                    eval_fast_mode=resolved_eval_fast_mode,
+                )
+                if run is not None:
+                    analysis = response.get("analysis", {}) or {}
+                    evidence = response.get("evidence", {}) or {}
+                    run.end(
+                        outputs={
+                            "strategy": analysis.get("strategy", ""),
+                            "evidence_mode": evidence.get("mode", ""),
+                            "document_count": len(response.get("documents", []) or []),
+                            "elapsed_seconds": response.get("elapsed_seconds", 0.0),
+                            "route_fallback": response.get("route_fallback", ""),
+                        }
+                    )
+                return response
+            except Exception as exc:
+                if run is not None:
+                    run.end(error=str(exc))
+                raise

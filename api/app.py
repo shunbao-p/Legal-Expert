@@ -105,6 +105,8 @@ def chat(payload: ChatRequest) -> ChatResponse:
             chat_id=payload.chat_id,
             question=payload.question,
             explain_routing=payload.explain_routing,
+            eval_batch_id=payload.eval_batch_id,
+            eval_fast_mode=payload.eval_fast_mode,
             active_file_ids=payload.active_file_ids,
         )
         return ChatResponse(**response)
